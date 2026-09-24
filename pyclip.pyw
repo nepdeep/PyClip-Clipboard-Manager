@@ -49,7 +49,13 @@ PASTE_DELAY_MS = 140      # let the target window regain focus before Ctrl+V
 MAX_IMAGE_PIXELS = 40_000_000
 MAX_ENCODED_IMAGE_BYTES = 100 * 1024 * 1024
 THUMBNAIL_SIZE = 96
-NOTEPAD_WIDTH = 260       # default width of the expandable notepad panel
+WINDOW_EDGE = 6           # how thick the invisible resize border is
+WINDOW_CORNER = 10        # corners get a bigger square, so they're easy to hit
+HISTORY_MIN_WIDTH = 300   # the clip list stays readable however narrow it's dragged
+WINDOW_MIN_HEIGHT = 300
+HISTORY_WIDTH_KEY = "history_width"     # how wide the clip list was dragged
+WINDOW_HEIGHT_KEY = "window_height"     # how tall the window was dragged
+NOTEPAD_WIDTH = 260      # default width of the expandable notepad panel
 NOTEPAD_MIN_WIDTH = 200   # narrow enough to stay a margin note
 NOTEPAD_MAX_WIDTH = 900   # wide enough to draft in, without hiding the history
 NOTE_GRIP_WIDTH = 8       # the drag handle down the pad's left edge
@@ -1184,6 +1190,31 @@ def clean_notepad_width(raw):
     return max(NOTEPAD_MIN_WIDTH, min(NOTEPAD_MAX_WIDTH, width))
 
 
+def clean_window_size(raw, default, least, most):
+    """A remembered window width or height, clamped to ``least..most``."""
+    try:
+        size = int(float(raw))
+    except (TypeError, ValueError):
+        return default
+    return max(least, min(most, size))
+
+
+def dragged_span(low, high, direction, travel, least, most, bound_low, bound_high):
+    """One axis of an edge drag: move an end of ``low..high`` (inclusive) by ``travel``.
+
+    ``direction`` picks the end: -1 moves ``low``, 1 moves ``high``, 0 neither.
+    The moving end stops at the screen's bounds and the length stays within
+    ``least..most``; the other end never moves.
+    """
+    if direction < 0:
+        low = max(bound_low, low + travel)
+        low = high + 1 - max(least, min(most, high + 1 - low))
+    elif direction > 0:
+        high = min(bound_high, high + travel)
+        high = low - 1 + max(least, min(most, high + 1 - low))
+    return low, high
+
+
 def mix(colour, other, weight):
     """``colour`` blended ``weight`` of the way over ``other``, as ``#rrggbb``."""
     a, b = QColor(colour), QColor(other)
@@ -1388,6 +1419,71 @@ class WindowDragHandle(QLabel):
         super().mouseReleaseEvent(event)
 
 
+class WindowEdgeGrip(QWidget):
+    """An invisible strip along one side or corner of the frameless window.
+
+    Dragging it resizes the window from that side while the opposite side
+    stays put, as a normal window border would. ``side`` is ``(dx, dy)``:
+    -1 for the left/top, 1 for the right/bottom, 0 for neither.
+    """
+
+    drag_started = Signal()
+    dragged = Signal(QPoint)   # cursor travel since the grip was grabbed
+    drag_finished = Signal()
+
+    def __init__(self, dx, dy, parent):
+        super().__init__(parent)
+        self.side = (dx, dy)
+        if dx and dy:
+            shape = (Qt.CursorShape.SizeFDiagCursor if dx == dy
+                     else Qt.CursorShape.SizeBDiagCursor)
+        else:
+            shape = Qt.CursorShape.SizeHorCursor if dx else Qt.CursorShape.SizeVerCursor
+        self.setCursor(shape)
+        self._origin = None
+
+    def place(self):
+        """Hug this grip's side of the window; called whenever the window resizes."""
+        dx, dy = self.side
+        thickness = WINDOW_CORNER if dx and dy else WINDOW_EDGE
+        window = self.parentWidget()
+        x, width = self._span(dx, window.width(), thickness)
+        y, height = self._span(dy, window.height(), thickness)
+        self.setGeometry(x, y, width, height)
+
+    @staticmethod
+    def _span(direction, length, thickness):
+        """Start and size along one axis: against an end, or between the corners."""
+        if direction < 0:
+            return 0, thickness
+        if direction > 0:
+            return length - thickness, thickness
+        return WINDOW_CORNER, max(0, length - 2 * WINDOW_CORNER)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._origin = event.globalPosition().toPoint()
+            self.drag_started.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._origin is not None:
+            self.dragged.emit(event.globalPosition().toPoint() - self._origin)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._origin is not None and event.button() == Qt.MouseButton.LeftButton:
+            self._origin = None
+            self.drag_finished.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class NoteResizeGrip(QWidget):
     """The grip down the pad's left edge; dragging it sets the pad's width.
 
@@ -1503,6 +1599,8 @@ class HistoryWindow(QWidget):
         self._notepad_pinned = False  # notepad-only, always-on-top mode
         self._notepad_width = NOTEPAD_WIDTH
         self._resize_origin = None
+        self._edge_origin = None      # window geometry when an edge was grabbed
+        self._edge_grips = []
         self._dir_open = False
 
         self.setObjectName("root")
@@ -1512,8 +1610,16 @@ class HistoryWindow(QWidget):
             | Qt.WindowType.Tool
             | Qt.WindowType.WindowStaysOnTopHint
         )
-        self.resize(self.BASE_WIDTH, self.BASE_HEIGHT)
+        # The clip list's width is what the window is with the pad closed.
+        desktop = QGuiApplication.primaryScreen().availableVirtualGeometry()
+        self._history_width = clean_window_size(
+            db.get_setting(HISTORY_WIDTH_KEY, ""), self.BASE_WIDTH,
+            HISTORY_MIN_WIDTH, desktop.width())
+        self.resize(self._history_width, clean_window_size(
+            db.get_setting(WINDOW_HEIGHT_KEY, ""), self.BASE_HEIGHT,
+            WINDOW_MIN_HEIGHT, desktop.height()))
         self._build_ui()
+        self._build_edge_grips()
         self._apply_style()
         # Let the tab row span the search row so the pad lines up with the list.
         self.search.ensurePolished()
@@ -1600,6 +1706,21 @@ class HistoryWindow(QWidget):
 
         self.notepad = self._build_notepad()
         columns.addWidget(self.notepad)
+
+    def _build_edge_grips(self):
+        """Resize handles around the frameless window, inside its margins.
+
+        Built after the rest of the UI so they sit on top of it.
+        """
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if not (dx or dy):
+                    continue
+                grip = WindowEdgeGrip(dx, dy, self)
+                grip.drag_started.connect(self._edge_grabbed)
+                grip.dragged.connect(lambda delta, g=grip: self._edge_dragged(g.side, delta))
+                grip.drag_finished.connect(self._edge_released)
+                self._edge_grips.append(grip)
 
     def _build_notepad(self):
         """A tabbed scratch pad beside the history, persisted the same way.
@@ -2250,7 +2371,7 @@ class HistoryWindow(QWidget):
         if self._notepad_pinned:
             margins = self.layout().contentsMargins()
             return margins.left() + margins.right() + NOTE_GRIP_WIDTH + self._notepad_width
-        return (self.BASE_WIDTH + self.COLUMN_GAP
+        return (self._history_width + self.COLUMN_GAP
                 + NOTE_GRIP_WIDTH + self._notepad_width)
 
     def _grip_grabbed(self):
@@ -2268,6 +2389,65 @@ class HistoryWindow(QWidget):
         self._resize_origin = None
         self._remember(NOTE_WIDTH_KEY, str(self._notepad_width))
 
+    # ---- resizing from the window's edges ----------------------------------
+
+    def _fixed_width(self):
+        """The part of the window an edge drag leaves alone: everything beside
+        the clip list, or beside the pad when it is pinned on its own."""
+        if self._notepad_pinned:
+            return self._open_width() - self._notepad_width
+        if self._notes_open:
+            return self._open_width() - self._history_width
+        return 0
+
+    def _edge_grabbed(self):
+        self._edge_origin = self.geometry()
+
+    def _edge_dragged(self, side, delta):
+        """Resize from the grabbed side; the opposite side stays where it was.
+
+        Extra width goes to the clip list - the pad keeps the width its own
+        grip gave it - unless the pad is pinned alone, when it is the pad's.
+        """
+        if self._edge_origin is None:
+            return
+        start, (dx, dy) = self._edge_origin, side
+        screen = self.screen().availableGeometry()
+        fixed = self._fixed_width()
+        if self._notepad_pinned:
+            least_w = fixed + NOTEPAD_MIN_WIDTH
+            most_w = min(screen.width(), fixed + NOTEPAD_MAX_WIDTH)
+        else:
+            least_w = max(fixed + HISTORY_MIN_WIDTH, self.minimumSizeHint().width())
+            most_w = screen.width()
+        least_h = max(WINDOW_MIN_HEIGHT, self.minimumSizeHint().height())
+
+        left, right = dragged_span(start.left(), start.right(), dx, delta.x(),
+                                   least_w, most_w, screen.left(), screen.right())
+        top, bottom = dragged_span(start.top(), start.bottom(), dy, delta.y(),
+                                   least_h, screen.height(), screen.top(), screen.bottom())
+        width = right - left + 1
+        if self._notepad_pinned:
+            self._notepad_width = width - fixed
+            self.notepad.setFixedWidth(self._notepad_width + NOTE_GRIP_WIDTH)
+            self.layout().activate()  # release the pad's old minimum before shrinking
+        else:
+            self._history_width = width - fixed
+        self.setGeometry(left, top, width, bottom - top + 1)
+
+    def _edge_released(self):
+        self._edge_origin = None
+        self._remember(WINDOW_HEIGHT_KEY, str(self.height()))
+        if self._notepad_pinned:
+            self._remember(NOTE_WIDTH_KEY, str(self._notepad_width))
+        else:
+            self._remember(HISTORY_WIDTH_KEY, str(self._history_width))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        for grip in self._edge_grips:
+            grip.place()
+
     def _set_notepad_visible(self, visible):
         self._notes_open = bool(visible)
         if not visible and self._notepad_pinned:
@@ -2279,7 +2459,8 @@ class HistoryWindow(QWidget):
         self.notes_toggle.setText("Notes ‹" if visible else "Notes ›")
 
         if not self._notepad_pinned:
-            self.resize(self._open_width() if visible else self.BASE_WIDTH, self.height())
+            self.layout().activate()  # drop the hidden pad from the minimum width
+            self.resize(self._open_width() if visible else self._history_width, self.height())
             if self.isVisible():  # a wider window must not spill off the screen edge
                 self._place_near(self.pos())
         self._remember(NOTE_OPEN_KEY, "1" if visible else "0")
@@ -2309,7 +2490,7 @@ class HistoryWindow(QWidget):
             margins = self.layout().contentsMargins()
             width = margins.left() + margins.right() + self._notepad_width + NOTE_GRIP_WIDTH
         else:
-            width = self._open_width() if self._notes_open else self.BASE_WIDTH
+            width = self._open_width() if self._notes_open else self._history_width
         self.resize(width, self.height())
         if self.isVisible():
             self._place_near(self.pos())
