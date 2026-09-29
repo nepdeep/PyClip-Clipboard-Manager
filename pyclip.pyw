@@ -221,8 +221,93 @@ def load_thumbnail(image_path):
     return QPixmap.fromImage(image)
 
 
-def clipboard_directories(kind, text, data):
-    """Find existing folders in file drops or plain, absolute path lines."""
+# Where a Windows path can begin inside text: "C:\", "C:/", "\\server\share\" or
+# "%VAR%\". The look-behind skips URLs ("https://") and words ending in a letter.
+_PATH_START = re.compile(
+    r"(?<![\w\\/:%])(?:[A-Za-z]:[\\/]|\\\\[^\\/\s\"'<>|*?]+[\\/]|%[A-Za-z_][\w()]*%[\\/])")
+_PATH_STOP = re.compile(r"[\"<>|*?\t]")          # characters no Windows path contains
+_PATH_TRAIL = " .,;:!)]}'\u2019\u201d"           # sentence punctuation after a path
+_FILE_URL = re.compile(r"file:/{2,3}[^\s\"'<>|]+", re.IGNORECASE)
+_FILE_NAME = re.compile(r".+\.[A-Za-z0-9]{1,8}")
+_MAX_PATH_SCAN = 100_000                          # characters of a text clip scanned
+_MAX_PATH_CUTS = 12                               # shorter prefixes tried per path
+
+
+def _absolute_path(path):
+    path = os.path.expandvars(path.strip())
+    if not os.path.splitdrive(path)[0] or not os.path.isabs(path):
+        return None
+    return os.path.normpath(path)
+
+
+def _existing_folder(path, roots):
+    """The folder `path` names (or the folder holding it, for a file), if it exists.
+    `roots` caches whether each drive or share is reachable, so an offline one is
+    asked about once rather than for every prefix tried."""
+    path = _absolute_path(path)
+    if not path:
+        return None
+    root = os.path.splitdrive(path)[0] + os.sep
+    try:
+        if root not in roots:
+            roots[root] = os.path.isdir(root)
+        if not roots[root]:
+            return None
+        if os.path.isdir(path):
+            return path
+        if os.path.isfile(path):
+            return os.path.dirname(path)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _paths_in_text(text):
+    """(raw path text, whether it is the whole line) for each path-like run."""
+    for line in text[:_MAX_PATH_SCAN].splitlines():
+        whole = line.strip().strip("\"'").rstrip(_PATH_TRAIL)
+        for url in _FILE_URL.findall(line):
+            local = QUrl(url.rstrip(_PATH_TRAIL)).toLocalFile()
+            if local:
+                yield local, url.rstrip(_PATH_TRAIL) == whole
+        line = _FILE_URL.sub(" ", line)
+        starts = [m.start() for m in _PATH_START.finditer(line)]
+        for n, start in enumerate(starts):
+            raw = line[start:starts[n + 1] if n + 1 < len(starts) else len(line)]
+            stop = _PATH_STOP.search(raw)
+            if stop:
+                raw = raw[:stop.start()]
+            yield raw, raw.rstrip(_PATH_TRAIL) == whole
+
+
+def _folder_from_text(raw, whole_line, roots):
+    """Paths in prose may contain spaces and run into the sentence around them, so
+    try the longest prefix first and back off one word at a time until a real
+    folder or file is found."""
+    cuts = [len(raw)] + [m.start() for m in reversed(list(re.finditer(r"\s", raw)))]
+    tried = set()
+    for cut in cuts[:_MAX_PATH_CUTS]:
+        piece = raw[:cut]
+        for candidate in (piece.rstrip(), piece.rstrip(_PATH_TRAIL)):
+            if candidate and candidate not in tried:
+                tried.add(candidate)
+                folder = _existing_folder(candidate, roots)
+                if folder:
+                    return folder
+    if not whole_line:
+        return None
+    # A line that is nothing but a path is kept even if its drive or share is
+    # offline right now; a name with an extension is taken to be a file.
+    path = _absolute_path(raw.rstrip(_PATH_TRAIL))
+    if path and _FILE_NAME.fullmatch(os.path.basename(path)):
+        path = os.path.dirname(path)
+    return path
+
+
+def clipboard_directories(kind, text, data, roots=None):
+    """Find folders in file drops, or anywhere in text that looks like a path."""
+    roots = {} if roots is None else roots
+    directories = {}
     if kind == "files":
         try:
             candidates = json.loads(data)
@@ -230,32 +315,14 @@ def clipboard_directories(kind, text, data):
             return []
         if not isinstance(candidates, list):
             return []
-    elif kind == "text":
-        candidates = (text or "").splitlines()
+        folders = (_existing_folder(c, roots) for c in candidates if isinstance(c, str))
+    elif kind == "text" and text:
+        folders = (_folder_from_text(raw, whole, roots) for raw, whole in _paths_in_text(text))
     else:
         return []
-
-    directories = {}
-    for candidate in candidates:
-        if not isinstance(candidate, str):
-            continue
-        path = candidate.strip().strip('"\'')
-        if path.lower().startswith("file:"):
-            path = QUrl(path).toLocalFile()
-        path = os.path.expandvars(path)
-        if not os.path.splitdrive(path)[0] or not os.path.isabs(path):
-            continue
-        path = os.path.normpath(path)
-        try:
-            if os.path.isdir(path):
-                folder = path
-            elif os.path.isfile(path):
-                folder = os.path.dirname(path)
-            else:
-                continue
-        except (OSError, ValueError):
-            continue
-        directories[os.path.normcase(folder)] = folder
+    for folder in folders:
+        if folder:
+            directories[os.path.normcase(folder)] = folder
     return list(directories.values())
 
 
@@ -336,16 +403,26 @@ class Database:
                 used_at REAL NOT NULL
             )"""
         )
+        # Kept apart from `directories` so clearing DIR history never unpins one.
+        self.conn.execute(
+            """CREATE TABLE IF NOT EXISTS favorite_directories (
+                path_key TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                added_at REAL NOT NULL
+            )"""
+        )
         self.conn.commit()
-        if self.get_setting("directory_history_imported") != "1":
+        # "2": rescan once more now that paths are also found inside text.
+        if self.get_setting("directory_history_imported") != "2":
+            roots = {}
             for clip in self.conn.execute(
                     "SELECT kind, text, data, created_at FROM clips "
                     "WHERE kind IN ('text', 'files')").fetchall():
                 self.remember_directories(
-                    clipboard_directories(clip["kind"], clip["text"], clip["data"]),
+                    clipboard_directories(clip["kind"], clip["text"], clip["data"], roots),
                     clip["created_at"],
                 )
-            self.set_setting("directory_history_imported", "1")
+            self.set_setting("directory_history_imported", "2")
 
     def get_setting(self, key, default=""):
         """Small key/value store for things that aren't clips (e.g. the notepad)."""
@@ -412,6 +489,30 @@ class Database:
         with self.conn:
             self.conn.execute("DELETE FROM directories WHERE path_key = ?",
                               (os.path.normcase(os.path.normpath(path)),))
+
+    def add_favorite(self, path):
+        path = os.path.normpath(path)
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO favorite_directories (path_key, path, added_at) "
+                "VALUES (?, ?, ?)", (os.path.normcase(path), path, time.time()))
+
+    def remove_favorite(self, path):
+        with self.conn:
+            self.conn.execute("DELETE FROM favorite_directories WHERE path_key = ?",
+                              (os.path.normcase(os.path.normpath(path)),))
+
+    def get_favorites(self, search=""):
+        """Favourites in the order they were added, so they stay where you put them."""
+        query = search.strip().casefold()
+        rows = self.conn.execute(
+            "SELECT path, added_at FROM favorite_directories ORDER BY added_at, path"
+        ).fetchall()
+        return [row for row in rows if query in row["path"].casefold()]
+
+    def favorite_keys(self):
+        return {row[0] for row in
+                self.conn.execute("SELECT path_key FROM favorite_directories")}
 
     def get_clips(self, search=None, limit=500, include_content=True):
         params = []
@@ -1601,7 +1702,8 @@ class HistoryWindow(QWidget):
         self._resize_origin = None
         self._edge_origin = None      # window geometry when an edge was grabbed
         self._edge_grips = []
-        self._dir_open = False
+        self._dir_open = False        # the folder panel (DIR or FAV) is showing
+        self._dir_fav = False         # ... and it is listing favourites only
 
         self.setObjectName("root")
         self.setWindowTitle("PyClip")
@@ -1627,6 +1729,7 @@ class HistoryWindow(QWidget):
         self._tabs_row.setFixedHeight(row_height)
         self._note_add.setFixedHeight(row_height)
         self._dir_tab.setFixedHeight(row_height)
+        self._fav_tab.setFixedHeight(row_height)
         self._restore_notepad()
 
     def _build_ui(self):
@@ -1784,7 +1887,17 @@ class HistoryWindow(QWidget):
         self._dir_tab.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._dir_tab.setCursor(Qt.CursorShape.PointingHandCursor)
         self._dir_tab.setToolTip("Search previously copied folder locations")
-        self._dir_tab.clicked.connect(self._show_directories)
+        self._dir_tab.clicked.connect(lambda: self._show_directories(favorites=False))
+
+        self._fav_tab = QToolButton()
+        self._fav_tab.setObjectName("noteTab")
+        self._fav_tab.setText("FAV")
+        self._fav_tab.setCheckable(True)
+        self._fav_tab.setFixedWidth(40)
+        self._fav_tab.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._fav_tab.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._fav_tab.setToolTip("Favourite folders  (right-click a folder in DIR to add one)")
+        self._fav_tab.clicked.connect(lambda: self._show_directories(favorites=True))
 
         self._pin_check = QCheckBox()
         self._pin_check.setObjectName("pinNotepad")
@@ -1800,6 +1913,7 @@ class HistoryWindow(QWidget):
         tabs_bar.setSpacing(2)
         tabs_bar.addWidget(self._tabs_row, 1)
         tabs_bar.addWidget(self._dir_tab)
+        tabs_bar.addWidget(self._fav_tab)
         tabs_bar.addWidget(self._pin_check)
         tabs_bar.addWidget(self._note_add)
         box.addLayout(tabs_bar)
@@ -1949,7 +2063,7 @@ class HistoryWindow(QWidget):
         self.dir_list.setItemDelegate(ClipDelegate(self.dir_list))
         self.dir_list.setUniformItemSizes(True)
         self.dir_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.dir_list.itemActivated.connect(self._open_directory)
+        self.dir_list.itemDoubleClicked.connect(self._copy_directory)
         self.dir_list.itemSelectionChanged.connect(self._directory_selection_changed)
         self.dir_list.installEventFilter(self)
         self.dir_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1969,7 +2083,7 @@ class HistoryWindow(QWidget):
         self.dir_open_button.clicked.connect(self._open_directory)
         self.dir_copy_button = QToolButton()
         self.dir_copy_button.setText("Copy path")
-        self.dir_copy_button.setToolTip("Copy the selected folder path (Ctrl+C)")
+        self.dir_copy_button.setToolTip("Copy the selected folder path (double-click or Ctrl+C)")
         self.dir_copy_button.clicked.connect(self._copy_directory)
         for button in (self.dir_open_button, self.dir_copy_button):
             button.setObjectName("dirAction")
@@ -1983,12 +2097,16 @@ class HistoryWindow(QWidget):
         layout.addWidget(self.dir_status)
         return panel
 
-    def _show_directories(self, *_):
+    def _show_directories(self, favorites=False):
+        """DIR and FAV share one panel; FAV just lists the pinned folders."""
         self.save_notes()
         self._dir_open = True
+        self._dir_fav = favorites
         self._notes_stack.setCurrentWidget(self.directory_panel)
         self._refresh_note_tabs()
-        self._remember(DIR_OPEN_KEY, "1")
+        self._remember(DIR_OPEN_KEY, "fav" if favorites else "1")
+        self.dir_search.setPlaceholderText(
+            "Search favourite folders…" if favorites else "Search folders or paths…")
         self._reload_directories()
         self.dir_search.setFocus()
 
@@ -2004,14 +2122,25 @@ class HistoryWindow(QWidget):
     def _reload_directories(self, *_):
         selected = self._selected_directory()
         self.dir_list.clear()
-        for directory in self.db.get_directories(self.dir_search.text()):
-            path = directory["path"]
+        search = self.dir_search.text()
+        if self._dir_fav:
+            rows = [(row["path"], f'Added: {humanize(row["added_at"])}', True)
+                    for row in self.db.get_favorites(search)]
+        else:
+            favorites = self.db.favorite_keys()
+            rows = [(row["path"], f'Last used: {humanize(row["used_at"])}',
+                     os.path.normcase(row["path"]) in favorites)
+                    for row in self.db.get_directories(search)]
+        for path, when, favorite in rows:
+            name = os.path.basename(path) or path
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, {
-                "kind": "directory", "path": path,
-                "primary": os.path.basename(path) or path, "meta": path,
+                "kind": "directory", "path": path, "favorite": favorite,
+                # the star marks favourites in DIR; in FAV every row is one
+                "primary": f"★ {name}" if favorite and not self._dir_fav else name,
+                "meta": path,
             })
-            item.setToolTip(f'{path}\nLast used: {humanize(directory["used_at"])}')
+            item.setToolTip(f"{path}\n{when}")
             self.dir_list.addItem(item)
             if path == selected:
                 self.dir_list.setCurrentItem(item)
@@ -2019,11 +2148,18 @@ class HistoryWindow(QWidget):
             self.dir_list.setCurrentRow(0)
         self._directory_selection_changed()
         self.dir_empty.setVisible(not self.dir_list.count())
-        self.dir_empty.setText(
-            "No matching folders." if self.dir_search.text().strip() else
-            "Copy a folder, a file, or a full path to add its location here."
-        )
-        self.dir_status.setText(f"{self.dir_list.count()} folders · most recent first")
+        if search.strip():
+            self.dir_empty.setText("No matching folders.")
+        elif self._dir_fav:
+            self.dir_empty.setText(
+                "No favourites yet. Right-click a folder in DIR and choose Add to Favourites.")
+        else:
+            self.dir_empty.setText(
+                "Copy a folder, a file, or a full path to add its location here.")
+        count = self.dir_list.count()
+        self.dir_status.setText(
+            f"{count} favourite{'' if count == 1 else 's'} · in the order added"
+            if self._dir_fav else f"{count} folders · most recent first")
         self.dir_status.setToolTip("")
 
     def _open_directory(self, *_):
@@ -2055,26 +2191,50 @@ class HistoryWindow(QWidget):
         self.dir_list.setCurrentItem(item)
         self._menu_open = True
         menu = QMenu(self)
+        if (item.data(Qt.ItemDataRole.UserRole) or {}).get("favorite"):
+            menu.addAction("Remove from Favourites", self._unfavorite_directory)
+        else:
+            menu.addAction("Add to Favourites", self._favorite_directory)
+        menu.addSeparator()
         menu.addAction("Open folder", self._open_directory)
         menu.addAction("Copy path", self._copy_directory)
-        menu.addSeparator()
-        menu.addAction("Remove from DIR", self._forget_directory)
+        if not self._dir_fav:
+            menu.addSeparator()
+            menu.addAction("Remove from DIR", self._forget_directory)
         try:
             menu.exec(self.dir_list.mapToGlobal(pos))
         finally:
             self._menu_open = False
 
     def _forget_directory(self):
+        """Delete: in FAV that unpins the folder, in DIR it drops it from history."""
+        if self._dir_fav:
+            self._unfavorite_directory()
+            return
         path = self._selected_directory()
         if path:
             self.db.forget_directory(path)
             self._reload_directories()
 
+    def _favorite_directory(self):
+        path = self._selected_directory()
+        if path:
+            self.db.add_favorite(path)
+            self._reload_directories()
+            self.dir_status.setText("Added to Favourites")
+
+    def _unfavorite_directory(self):
+        path = self._selected_directory()
+        if path:
+            self.db.remove_favorite(path)
+            self._reload_directories()
+            self.dir_status.setText("Removed from Favourites")
+
     # ---- notepad -----------------------------------------------------------
 
     def _restore_notepad(self):
         """Rebuild the strip the way it was left: same notes, same order, same width."""
-        dir_open = self.db.get_setting(DIR_OPEN_KEY) == "1"
+        dir_open = self.db.get_setting(DIR_OPEN_KEY)  # "1" = DIR, "fav" = FAV
         for slot in clean_note_order(self.db.get_setting(NOTE_ORDER_KEY, "")):
             self._create_note(slot)
 
@@ -2089,8 +2249,8 @@ class HistoryWindow(QWidget):
         self._set_notepad_visible(self.db.get_setting(NOTE_OPEN_KEY, "0") == "1")
         if self.db.get_setting(NOTE_PINNED_KEY, "0") == "1":
             self._set_notepad_pinned(True)
-        if dir_open:
-            self._show_directories()
+        if dir_open in ("1", "fav"):
+            self._show_directories(favorites=dir_open == "fav")
 
     def _create_note(self, slot, position=None):
         """Add one note - its stored text, tab and editor - to the strip.
@@ -2151,11 +2311,16 @@ class HistoryWindow(QWidget):
         for i, edit in enumerate(self._note_edits):
             edit.setStyleSheet(note_editor_style(self._note_colors[i]))
         self._note_add.setEnabled(len(self._note_tabs) < NOTE_MAX_COUNT)
-        self._dir_tab.setChecked(self._dir_open)
-        self._dir_tab.setStyleSheet(note_tab_style("#2ab5a5", self._dir_open))
-        self._panel_hint.setText("Folders from clipboard history" if self._dir_open else
+        dir_active = self._dir_open and not self._dir_fav
+        fav_active = self._dir_open and self._dir_fav
+        self._dir_tab.setChecked(dir_active)
+        self._dir_tab.setStyleSheet(note_tab_style("#2ab5a5", dir_active))
+        self._fav_tab.setChecked(fav_active)
+        self._fav_tab.setStyleSheet(note_tab_style("#d9a521", fav_active))
+        self._panel_hint.setText("Favourite folders" if fav_active else
+                                 "Folders from clipboard history" if dir_active else
                                  "Drag tabs to reorder · double-click to rename")
-        self._panel_keys.setText("Enter opens · Ctrl+C copies · right-click for more"
+        self._panel_keys.setText("Double-click/Ctrl+C copies · Enter opens · right-click for more"
                                  if self._dir_open else
                                  "Ctrl+T adds · Ctrl+W closes · right-click for more")
 
