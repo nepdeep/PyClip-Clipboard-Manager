@@ -19,6 +19,8 @@ import sqlite3
 import hashlib
 import logging
 import threading
+import tempfile
+import uuid
 import winreg
 import ctypes
 from ctypes import wintypes
@@ -31,13 +33,14 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QColor, QFont, QFontMetrics, QPixmap, QPainter, QPen, QGuiApplication,
     QCursor, QIcon, QImage, QImageReader, QKeySequence, QTextCursor,
-    QDesktopServices,
+    QDesktopServices, QTextBlockFormat, QTextCharFormat, QTextFormat,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QLabel,
     QListWidget, QListWidgetItem, QStyledItemDelegate, QStyle, QMenu,
-    QAbstractItemView, QSystemTrayIcon, QMessageBox, QPlainTextEdit, QToolButton,
+    QAbstractItemView, QSystemTrayIcon, QMessageBox, QTextEdit, QToolButton,
     QSizePolicy, QStackedWidget, QScrollArea, QFrame, QCheckBox,
+    QDialog, QDialogButtonBox, QComboBox, QPushButton, QFileDialog,
 )
 
 APP_VERSION = "1.1.0"
@@ -68,6 +71,11 @@ NOTE_TITLE_MAX = 14       # characters a tab caption keeps
 NOTE_TEXT_KEY = "notepad_text"
 NOTE_TITLE_KEY = "notepad_title"
 NOTE_COLOR_KEY = "notepad_color"
+NOTE_ID_KEY = "notepad_sync_id"
+NOTE_SYNC_CONFIG_KEY = "notepad_sync_config"
+NOTE_SYNC_STATE_KEY = "notepad_sync_state"
+NOTE_SYNC_INTERVAL_MS = 15000
+NOTE_SYNC_FOLDER = "PyClip Notes"
 NOTE_OPEN_KEY = "notepad_open"
 NOTE_TAB_KEY = "notepad_tab"            # which note was showing last (a slot id)
 NOTE_ORDER_KEY = "notepad_order"        # slot ids, left to right along the strip
@@ -75,6 +83,16 @@ NOTE_WIDTH_KEY = "notepad_width"        # how wide the pad was dragged
 NOTE_PINNED_KEY = "notepad_pinned"      # notepad-only, always-on-top mode
 DIR_OPEN_KEY = "directory_tab_open"
 NOTE_STAMP_FORMAT = "%Y-%m-%d %H:%M"   # what F5 drops into the notepad
+NOTE_RICH_PREFIX = "<!--pyclip-rich-->"  # a stored note starting with this is HTML
+NOTE_BODY_PX = 12                        # the pad's body text; matches its stylesheet
+NOTE_HEADING_PT = {1: 18, 2: 14, 3: 12}  # Word-style Heading 1-3, all bold
+NOTE_FONT_SIZES = (8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48)  # points
+NOTE_HIGHLIGHTS = (
+    ("Red", "#f28b82"),
+    ("Yellow", "#fdd663"),
+    ("Green", "#81c995"),
+)
+NOTE_HIGHLIGHT_INK = "#1b1f27"  # dark text, so a highlight stays readable on the dark pad
 
 # Colours a tab can take. The first NOTE_COUNT double as the defaults, so the
 # tabs already tell apart before anyone renames or recolours one.
@@ -668,6 +686,12 @@ user32.BringWindowToTop.restype = wintypes.BOOL
 kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
 kernel32.CreateMutexW.restype = wintypes.HANDLE
+kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+kernel32.CreateEventW.restype = wintypes.HANDLE
+kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+kernel32.SetEvent.restype = wintypes.BOOL
+kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+kernel32.WaitForSingleObject.restype = wintypes.DWORD
 kernel32.GetLastError.restype = wintypes.DWORD
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.CloseHandle.restype = wintypes.BOOL
@@ -684,8 +708,26 @@ class SingleInstance:
         if not self.handle:
             raise ctypes.WinError()
         self.already_running = kernel32.GetLastError() == ERROR_ALREADY_EXISTS
+        self.activation = kernel32.CreateEventW(None, False, False, INSTANCE_MUTEX_NAME + "-Show")
+        if not self.activation:
+            error = ctypes.WinError()
+            kernel32.CloseHandle(self.handle)
+            self.handle = None
+            raise error
+
+    def request_activation(self):
+        """A manual second launch asks the tray instance to show its window."""
+        if not kernel32.SetEvent(self.activation):
+            raise ctypes.WinError()
+
+    def take_activation(self):
+        # Auto-reset event retains a request even while the first copy starts up.
+        return kernel32.WaitForSingleObject(self.activation, 0) == 0
 
     def close(self):
+        if self.activation:
+            kernel32.CloseHandle(self.activation)
+            self.activation = None
         if self.handle:
             kernel32.CloseHandle(self.handle)
             self.handle = None
@@ -1209,6 +1251,81 @@ def toggle_done(line):
 
 
 # =============================================================================
+#  Notepad text styles  (headings, sizes and highlights)
+# =============================================================================
+#
+# A note stays plain text until someone styles it; only then is it stored as
+# HTML, behind NOTE_RICH_PREFIX. Sizes are kept as pixel sizes because that is
+# how Qt records the pad's own 12px body text, but menus speak Word's points.
+
+SIZE_PROPS = (QTextFormat.Property.FontPixelSize, QTextFormat.Property.FontPointSize)
+HIGHLIGHT_PROPS = (QTextFormat.Property.BackgroundBrush,
+                   QTextFormat.Property.ForegroundBrush)
+
+
+def pt_to_px(points):
+    return round(points * 4 / 3)
+
+
+def px_to_pt(pixels):
+    return round(pixels * 3 / 4)
+
+
+def styled_format(fmt):
+    """Whether one run of text carries a size, weight or highlight of its own."""
+    size = fmt.property(QTextFormat.Property.FontPixelSize)
+    return (fmt.background().style() != Qt.BrushStyle.NoBrush
+            or fmt.fontWeight() > QFont.Weight.Normal.value
+            or fmt.hasProperty(QTextFormat.Property.FontPointSize)
+            or (size is not None and size != NOTE_BODY_PX))
+
+
+def note_is_rich(doc):
+    """Whether ``doc`` holds anything plain text would lose."""
+    block = doc.begin()
+    while block.isValid():
+        if block.blockFormat().headingLevel() or any(
+                styled_format(part.format) for part in block.textFormats()):
+            return True
+        block = block.next()
+    return False
+
+
+class NoteEdit(QTextEdit):
+    """One note's editor: styled text, but only plain text gets pasted in.
+
+    ``stored()`` is what goes into the settings table; it is only rebuilt once
+    the document has changed, so loading a styled note and saving it again
+    never produces a different string (which sync would read as an edit).
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._stored = ""
+
+    def load(self, stored):
+        if stored.startswith(NOTE_RICH_PREFIX):
+            self.setHtml(stored[len(NOTE_RICH_PREFIX):])
+        else:
+            self.setPlainText(stored)
+        self._stored = stored
+        self.document().setModified(False)
+
+    def stored(self):
+        doc = self.document()
+        if doc.isModified():
+            self._stored = (NOTE_RICH_PREFIX + doc.toHtml() if note_is_rich(doc)
+                            else doc.toPlainText())
+            doc.setModified(False)
+        return self._stored
+
+    def insertFromMimeData(self, source):
+        # Clips carry other apps' fonts and colours; the pad's styles are its own.
+        if source.hasText():
+            self.insertPlainText(source.text())
+
+
+# =============================================================================
 #  Notepad tabs  (independent notes, each with its own title, colour and slot)
 # =============================================================================
 #
@@ -1255,7 +1372,7 @@ def clean_note_color(raw, slot):
     return colour if HEX_COLOR.match(colour) else default_note_color(slot)
 
 
-def clean_note_order(raw):
+def clean_note_order(raw, limit=NOTE_MAX_COUNT):
     """The stored strip order, filtered down to sane, unique slot numbers.
 
     The settings table is hand-editable and survives downgrades, so anything
@@ -1271,7 +1388,7 @@ def clean_note_order(raw):
     for slot in slots:
         if isinstance(slot, int) and not isinstance(slot, bool)                 and 0 <= slot < 1000 and slot not in order:
             order.append(slot)
-    return order[:NOTE_MAX_COUNT] or list(range(NOTE_COUNT))
+    return order[:limit] or list(range(NOTE_COUNT))
 
 
 def free_note_slot(taken):
@@ -1351,9 +1468,9 @@ def note_editor_style(colour):
     border = mix(colour, "#3a414f", 0.30)
     selection = mix(colour, "#1b1f27", 0.40)
     return (
-        f"QPlainTextEdit#notes {{ border:1px solid {border};"
+        f"QTextEdit#notes {{ border:1px solid {border};"
         f"  selection-background-color:{selection}; }}"
-        f"QPlainTextEdit#notes:focus {{ border:1px solid {colour}; }}"
+        f"QTextEdit#notes:focus {{ border:1px solid {colour}; }}"
     )
 
 
@@ -1673,6 +1790,497 @@ class NoteTitleEdit(QLineEdit):
         self.commit()
 
 
+class NoteSyncJournal:
+    """Immutable, content-addressed note revisions. No clocks or shared writes.
+
+    A deletion is a revision too. Parent links distinguish an offline edit from
+    a stale copy, and concurrent edits produce deterministic recovery notes.
+    Clipboard data and machine-specific preferences never enter this journal.
+    """
+
+    MAX_FILE_BYTES = 8 * 1024 * 1024
+    MAX_TOTAL_BYTES = 128 * 1024 * 1024
+    MAX_EVENTS = 25000
+
+    @staticmethod
+    def encode(value):
+        return json.dumps(value, sort_keys=True, ensure_ascii=False,
+                          separators=(",", ":")).encode("utf-8")
+
+    @classmethod
+    def revision(cls, note, parents, data):
+        event = {"schema": 1, "note": note, "parents": sorted(parents), "data": data}
+        event["id"] = hashlib.sha256(cls.encode(event)).hexdigest()
+        return event
+
+    @classmethod
+    def validate(cls, event):
+        if not isinstance(event, dict) or set(event) != {"schema", "id", "note", "parents", "data"}:
+            raise ValueError("Unrecognized note revision; the original files were kept.")
+        if event["schema"] != 1 or not re.fullmatch(r"[0-9a-f]{32}", str(event["note"])):
+            raise ValueError("Unsupported note revision.")
+        parents = event["parents"]
+        if (not isinstance(parents, list) or len(parents) > cls.MAX_EVENTS
+                or any(not isinstance(p, str) or not re.fullmatch(r"[0-9a-f]{64}", p) for p in parents)
+                or len(parents) != len(set(parents))):
+            raise ValueError("Invalid note revision history.")
+        data = event["data"]
+        if data is not None:
+            if (not isinstance(data, dict) or set(data) != {"text", "title", "color", "position"}
+                    or not all(isinstance(data.get(k), str) for k in ("text", "title", "color"))
+                    or not HEX_COLOR.fullmatch(data["color"])
+                    or type(data["position"]) is not int or not 0 <= data["position"] < 1000
+                    or len(data["title"]) > NOTE_TITLE_MAX):
+                raise ValueError("Invalid note content; the original files were kept.")
+        if cls.revision(event["note"], parents, data) != event:
+            raise ValueError("A note revision is damaged; the original files were kept.")
+        return event
+
+    @classmethod
+    def heads(cls, events):
+        groups, superseded = {}, set()
+        for key, event in events.items():
+            if key != event["id"]:
+                raise ValueError("Invalid revision identifier.")
+            for parent in event["parents"]:
+                if parent not in events:
+                    raise ValueError("Waiting for the desktop app to download the rest of the notes.")
+                if events[parent]["note"] != event["note"]:
+                    raise ValueError("Invalid note ancestry.")
+                superseded.add(parent)
+            groups.setdefault(event["note"], []).append(key)
+        return {note: sorted(k for k in keys if k not in superseded)
+                for note, keys in groups.items()}
+
+    @classmethod
+    def reconcile(cls, original):
+        """Merge independently edited notes; retain both contents on a conflict."""
+        events = dict(original)
+        for note, heads in cls.heads(events).items():
+            if len(heads) <= 1:
+                continue
+            live = [events[key] for key in heads if events[key]["data"] is not None]
+            # An edit concurrent with a deletion wins, preserving the edited note.
+            winner = live[0]["data"] if live else None
+            contents = set()
+            for event in live:
+                data = event["data"]
+                content = cls.encode({k: v for k, v in data.items() if k != "position"})
+                if content in contents:
+                    continue
+                contents.add(content)
+                if len(contents) == 1:
+                    continue
+                # Every PC derives the same ID, so retrying cannot duplicate a copy.
+                copy_id = hashlib.sha256(("conflict:" + event["id"]).encode()).hexdigest()[:32]
+                copy_data = dict(data)
+                copy_data["title"] = (data["title"] or "Note")[:5] + " (copy)"
+                copy_event = cls.revision(copy_id, [], copy_data)
+                events.setdefault(copy_event["id"], copy_event)
+            merged = cls.revision(note, heads, winner)
+            events[merged["id"]] = merged
+        notes = {}
+        for note, heads in cls.heads(events).items():
+            if len(heads) != 1:
+                raise ValueError("The note history could not be merged safely.")
+            data = events[heads[0]]["data"]
+            if data is not None:
+                notes[note] = data
+        if len(notes) >= 1000:
+            raise ValueError("Too many synced notes to display safely.")
+        return events, notes
+
+    @classmethod
+    def exchange(cls, folder, local, cancelled, cache):
+        """Runs only on a worker thread. Atomic files; never share the SQLite DB."""
+        if not os.path.isdir(folder):
+            raise OSError("The selected folder is unavailable. Reconnect the drive or choose another folder.")
+        destination = os.path.join(folder, NOTE_SYNC_FOLDER, "revisions")
+        os.makedirs(destination, exist_ok=True)
+        events = dict(local)
+        present, total = set(), 0
+        with os.scandir(destination) as entries:
+            for entry in entries:
+                if cancelled.is_set():
+                    return None
+                if not entry.name.endswith(".json"):
+                    continue  # unfinished atomic writes are never imported
+                if not re.fullmatch(r"[0-9a-f]{64}\.json", entry.name):
+                    raise ValueError("An unexpected revision file needs review in the sync folder.")
+                stat = entry.stat()
+                total += stat.st_size
+                if (stat.st_size > cls.MAX_FILE_BYTES or total > cls.MAX_TOTAL_BYTES
+                        or len(present) >= cls.MAX_EVENTS):
+                    raise ValueError("The sync history is too large. Choose a new folder to start a fresh history.")
+                stamp = (stat.st_size, stat.st_mtime_ns)
+                cached = cache.get(entry.name)
+                if cached and cached[0] == stamp:
+                    event = cached[1]
+                else:
+                    with open(entry.path, "rb") as source:
+                        raw = source.read(cls.MAX_FILE_BYTES + 1)
+                    if len(raw) > cls.MAX_FILE_BYTES:
+                        raise ValueError("A note revision is too large.")
+                    event = cls.validate(json.loads(raw))
+                    cache[entry.name] = (stamp, event)
+                if entry.name != event["id"] + ".json":
+                    raise ValueError("A revision filename does not match its content.")
+                events[event["id"]] = event
+                present.add(event["id"])
+        cls.heads(events)  # wait for complete histories before applying or publishing
+        outgoing = {key: cls.encode(event) for key, event in local.items() if key not in present}
+        if len(events) > cls.MAX_EVENTS or total + sum(map(len, outgoing.values())) > cls.MAX_TOTAL_BYTES:
+            raise ValueError("The sync history is too large. Choose a new folder to start a fresh history.")
+        for key, event in local.items():
+            if cancelled.is_set():
+                return None
+            if key in present:
+                continue
+            raw = outgoing[key]
+            if len(raw) > cls.MAX_FILE_BYTES:
+                raise ValueError("A note is too large to sync; it is still saved locally.")
+            fd, temporary = tempfile.mkstemp(prefix=".pyclip-", suffix=".tmp", dir=destination)
+            try:
+                with os.fdopen(fd, "wb") as target:
+                    target.write(raw)
+                    target.flush()
+                    os.fsync(target.fileno())
+                if cancelled.is_set():
+                    return None
+                os.replace(temporary, os.path.join(destination, key + ".json"))
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+        return events
+
+
+class NoteSyncController(QObject):
+    completed = Signal(int, object, str)
+    status_changed = Signal(str)
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.window, self.db = window, window.db
+        self.events, self.baseline, self.config = {}, {}, {"provider": "local", "folder": ""}
+        self.status = "Local only"
+        self.busy = False
+        self.generation = 0
+        self.cancelled = threading.Event()
+        self.cache = {}
+        self.pending = None
+        self.stopped = False
+        self.load_error = False
+        self.initialized = False
+        try:
+            config = json.loads(self.db.get_setting(NOTE_SYNC_CONFIG_KEY, "{}"))
+            if (not isinstance(config, dict)
+                    or config.get("provider", "local") not in ("local", "google", "dropbox", "folder")
+                    or not isinstance(config.get("folder", ""), str)):
+                raise ValueError("Invalid sync configuration.")
+            self.config.update(config)
+            state = json.loads(self.db.get_setting(NOTE_SYNC_STATE_KEY, "{}"))
+            self.events = state.get("events", {})
+            self.baseline = state.get("baseline", {})
+            self.initialized = bool(state)
+            for event in self.events.values():
+                NoteSyncJournal.validate(event)
+            NoteSyncJournal.heads(self.events)
+            if not isinstance(self.baseline, dict):
+                raise ValueError("Invalid local sync state.")
+            for note, data in self.baseline.items():
+                if data is None:
+                    raise ValueError("Invalid local note snapshot.")
+                NoteSyncJournal.validate(NoteSyncJournal.revision(note, [], data))
+        except (ValueError, TypeError, AttributeError):
+            self.load_error = True
+            self.set_status("Local sync history needs repair; notes are saved locally")
+        self.timer = QTimer(self)
+        self.timer.setInterval(NOTE_SYNC_INTERVAL_MS)
+        self.timer.timeout.connect(self.sync_now)
+        self.debounce = QTimer(self)
+        self.debounce.setSingleShot(True)
+        self.debounce.setInterval(1200)
+        self.debounce.timeout.connect(self.sync_now)
+        self.apply_timer = QTimer(self)
+        self.apply_timer.setSingleShot(True)
+        self.apply_timer.setInterval(1000)
+        self.apply_timer.timeout.connect(self.apply_pending)
+        self.completed.connect(self.receive)
+        if self.enabled:
+            self.timer.start()
+            self.debounce.start()
+
+    @property
+    def enabled(self):
+        return self.config.get("provider") in ("google", "dropbox", "folder") and bool(self.config.get("folder"))
+
+    def set_status(self, text):
+        self.status = text
+        self.status_changed.emit(text)
+
+    def capture(self):
+        """Capture on the GUI thread; the worker never touches widgets or SQLite."""
+        if self.load_error:
+            return
+        current = self.window._note_snapshot()
+        if not self.initialized:
+            self.baseline = {}
+            # Do not add five unused starter tabs when joining an existing folder.
+            seed = self.window._notes_to_seed(current)
+        else:
+            seed = current
+        heads = NoteSyncJournal.heads(self.events)
+        updated = dict(self.events)
+        for note in set(seed) | set(self.baseline):
+            data = seed.get(note)
+            if data == self.baseline.get(note):
+                continue
+            if data is None and note not in heads:
+                continue
+            event = NoteSyncJournal.revision(note, heads.get(note, []), data)
+            updated[event["id"]] = event
+        if updated != self.events or current != self.baseline or not self.initialized:
+            # Do not advance the in-memory base unless the disk commit succeeds.
+            self.db.set_setting(NOTE_SYNC_STATE_KEY, json.dumps(
+                {"events": updated, "baseline": current}, ensure_ascii=False))
+            self.events, self.baseline = updated, current
+            self.initialized = True
+
+    def changed(self):
+        if self.enabled and not self.stopped:
+            self.debounce.start()
+
+    def configure(self, provider, folder):
+        if not self.window.save_notes():
+            raise sqlite3.OperationalError("The current note could not be saved locally.")
+        if self.initialized and not self.load_error:
+            self.capture()
+        if provider == "local" and not folder:
+            folder = self.config.get("folder", "")
+        config = {"provider": provider, "folder": folder}
+        # A different folder starts with just the current notes, not old/deleted history.
+        different = (provider != "local" and os.path.normcase(folder) != os.path.normcase(self.config.get("folder", "")))
+        if different and not self.load_error:
+            current = self.window._note_snapshot()
+            events = {}
+            for note, data in self.window._notes_to_seed(current).items():
+                event = NoteSyncJournal.revision(note, [], data)
+                events[event["id"]] = event
+            state = json.dumps({"events": events, "baseline": current}, ensure_ascii=False)
+        else:
+            state = None
+        with self.db.conn:
+            self.db.conn.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)",
+                                 (NOTE_SYNC_CONFIG_KEY, json.dumps(config)))
+            if state is not None:
+                self.db.conn.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)",
+                                     (NOTE_SYNC_STATE_KEY, state))
+        if state is not None:
+            self.events, self.baseline, self.initialized = events, current, True
+        self.cancelled.set()
+        self.cancelled = threading.Event()
+        self.generation += 1
+        self.config = config
+        self.cache = {}
+        self.pending = None
+        self.timer.stop()
+        self.debounce.stop()
+        self.apply_timer.stop()
+        if self.enabled:
+            self.set_status("Saved locally · waiting for folder")
+            self.timer.start()
+            self.debounce.start()
+        else:
+            self.set_status("Local only")
+
+    def sync_now(self):
+        if self.stopped or self.load_error or not self.enabled:
+            return
+        if self.busy or self.pending is not None:
+            return
+        try:
+            if not self.window.save_notes():
+                raise sqlite3.OperationalError("The current note could not be saved locally.")
+            self.capture()
+        except (sqlite3.Error, ValueError):
+            self.set_status("Could not save sync history · retrying")
+            return
+        self.busy = True
+        generation, cancelled = self.generation, self.cancelled
+        folder, events, cache = self.config["folder"], dict(self.events), self.cache
+        self.set_status("Updating sync folder…")
+
+        def work():
+            result, error = None, ""
+            try:
+                result = NoteSyncJournal.exchange(folder, events, cancelled, cache)
+            except (OSError, ValueError, TypeError, RecursionError) as exc:
+                error = str(exc)
+            try:
+                # Also release busy after cancellation / an in-flight folder change.
+                self.completed.emit(generation, result, error)
+            except RuntimeError:
+                pass  # the owning window was destroyed during application shutdown
+
+        threading.Thread(target=work, name="PyClipNoteSync", daemon=True).start()
+
+    def receive(self, generation, events, error):
+        self.busy = False
+        if self.stopped or generation != self.generation or not self.enabled:
+            return
+        if error:
+            self.set_status("Saved locally · " + error)
+            return
+        if events is None:
+            return
+        self.pending = events
+        self.apply_pending()
+
+    def apply_pending(self):
+        if self.pending is None or self.stopped:
+            return
+        # Wait for a typing pause / rename dialog rather than replacing an editor mid-edit.
+        if (self.window._note_timer.isActive() or self.window._menu_open
+                or isinstance(QApplication.focusWidget(), NoteTitleEdit)
+                or QApplication.activeModalWidget() is not None
+                or QApplication.mouseButtons() != Qt.MouseButton.NoButton):
+            self.apply_timer.start()
+            return
+        try:
+            if not self.window.save_notes():
+                raise sqlite3.OperationalError("The current note could not be saved locally.")
+            self.capture()  # includes edits made while the folder worker was running
+            events, notes = NoteSyncJournal.reconcile({**self.pending, **self.events})
+            if notes:
+                self.window._apply_synced_notes(notes, events)
+                self.baseline = self.window._note_snapshot()
+            else:
+                # All remote notes were deleted: retain one empty local scratch pad.
+                if self.events or self.pending:
+                    self.window._apply_synced_notes({}, events)
+                    self.baseline = self.window._note_snapshot()
+            self.events = events
+            unpublished = bool(set(events) - set(self.pending))
+            self.pending = None
+            if unpublished:
+                self.set_status("Saved locally · updating recent changes")
+                self.debounce.start()
+            else:
+                self.set_status("Folder updated " + time.strftime("%H:%M") + " · cloud sync by desktop app")
+        except (sqlite3.Error, ValueError) as exc:
+            self.pending = None
+            self.set_status("Saved locally · " + str(exc))
+
+    def stop(self):
+        saved = self.window.save_notes()
+        if saved and self.initialized and not self.load_error:
+            try:
+                self.capture()
+            except (sqlite3.Error, ValueError):
+                logger.exception("Could not save local note sync state at shutdown")
+        self.stopped = True
+        self.cancelled.set()
+        self.timer.stop()
+        self.debounce.stop()
+        self.apply_timer.stop()
+
+
+class NoteSyncDialog(QDialog):
+    def __init__(self, controller, parent):
+        super().__init__(parent)
+        self.controller = controller
+        self.setWindowTitle("Note sync")
+        self.setMinimumWidth(470)
+        self.setStyleSheet("""
+            QDialog { background:#1b1f27; }
+            QLabel { color:#d4d9e2; }
+            QPushButton, QComboBox { background:#2a2f3a; color:#e8eaed;
+                border:1px solid #465061; border-radius:5px; padding:7px 10px; }
+            QPushButton:hover, QComboBox:hover { border-color:#4c8bf5; }
+            QPushButton:disabled, QLineEdit:disabled { color:#7d838f; }
+            QComboBox QAbstractItemView { background:#2a2f3a; color:#e8eaed;
+                selection-background-color:#33405a; }
+        """)
+        box = QVBoxLayout(self)
+        intro = QLabel("Notes always save on this PC first. Choose an optional synced folder to share them across your PCs.")
+        intro.setWordWrap(True)
+        box.addWidget(intro)
+        self.provider = QComboBox()
+        for title, key in (("Local only (default)", "local"), ("Google Drive folder", "google"),
+                           ("Dropbox folder", "dropbox"), ("Other synced folder", "folder")):
+            self.provider.addItem(title, key)
+        self.provider.setCurrentIndex(max(0, self.provider.findData(controller.config.get("provider"))))
+        box.addWidget(self.provider)
+        self.help = QLabel()
+        self.help.setWordWrap(True)
+        box.addWidget(self.help)
+        self.setup = QPushButton("Desktop app setup")
+        self.setup.clicked.connect(self.open_setup)
+        box.addWidget(self.setup)
+        row = QHBoxLayout()
+        self.folder = QLineEdit(controller.config.get("folder", ""))
+        self.folder.setPlaceholderText("Choose a folder in your signed-in desktop app")
+        self.browse = QPushButton("Choose folder…")
+        self.browse.clicked.connect(self.choose_folder)
+        row.addWidget(self.folder, 1)
+        row.addWidget(self.browse)
+        box.addLayout(row)
+        details = QLabel("PyClip creates a ‘PyClip Notes’ subfolder. Select the same folder on each PC and keep it available offline. Only notes, titles, colours and tab order are shared. Conflicting edits are kept as separate copies.")
+        details.setWordWrap(True)
+        box.addWidget(details)
+        self.status = QLabel(controller.status)
+        self.status.setWordWrap(True)
+        controller.status_changed.connect(self.status.setText)
+        box.addWidget(self.status)
+        actions = QHBoxLayout()
+        self.sync = QPushButton("Sync now")
+        self.sync.setEnabled(controller.enabled)
+        self.sync.clicked.connect(controller.sync_now)
+        actions.addWidget(self.sync)
+        actions.addStretch()
+        box.addLayout(actions)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.save)
+        buttons.rejected.connect(self.reject)
+        box.addWidget(buttons)
+        self.provider.currentIndexChanged.connect(self.update_provider)
+        self.update_provider()
+
+    def update_provider(self, *_):
+        provider = self.provider.currentData()
+        self.folder.setEnabled(provider != "local")
+        self.browse.setEnabled(provider != "local")
+        self.setup.setVisible(provider in ("google", "dropbox"))
+        self.help.setText({
+            "local": "Notes stay on this PC. Turning sync off keeps your local notes and existing cloud files.",
+            "google": "Sign in to Google Drive for desktop, then choose a folder from that account. This syncs PyClip notes, not Google Keep.",
+            "dropbox": "Sign in to the Dropbox desktop app, then choose a folder from that account.",
+            "folder": "Choose a folder managed by your sync app or a shared drive.",
+        }[provider])
+
+    def open_setup(self):
+        url = ("https://support.google.com/drive/answer/10838124" if self.provider.currentData() == "google"
+               else "https://www.dropbox.com/desktop")
+        QDesktopServices.openUrl(QUrl(url))
+
+    def choose_folder(self):
+        selected = QFileDialog.getExistingDirectory(self, "Choose your synced notes folder", self.folder.text())
+        if selected:
+            self.folder.setText(selected)
+
+    def save(self):
+        provider, folder = self.provider.currentData(), self.folder.text().strip()
+        if provider != "local" and not os.path.isabs(folder):
+            self.status.setText("Choose an absolute folder path before enabling sync.")
+            return
+        try:
+            self.controller.configure(provider, os.path.normpath(folder) if folder else "")
+        except (sqlite3.Error, ValueError) as exc:
+            self.status.setText("Could not save sync settings: " + str(exc))
+            return
+        self.accept()
+
+
 class HistoryWindow(QWidget):
     paste_requested = Signal(list)  # list of clip ids (display order)
     copy_requested = Signal(list)
@@ -1689,6 +2297,8 @@ class HistoryWindow(QWidget):
         "number": (Qt.Key.Key_7, Qt.Key.Key_Ampersand),
         "todo":   (Qt.Key.Key_9, Qt.Key.Key_ParenLeft),
     }
+    # Ctrl+Alt+digit, as in Word: Normal, then Heading 1-3
+    HEADING_KEYS = {Qt.Key.Key_0: 0, Qt.Key.Key_1: 1, Qt.Key.Key_2: 2, Qt.Key.Key_3: 3}
 
     def __init__(self, db):
         super().__init__()
@@ -1731,6 +2341,9 @@ class HistoryWindow(QWidget):
         self._dir_tab.setFixedHeight(row_height)
         self._fav_tab.setFixedHeight(row_height)
         self._restore_notepad()
+        self.note_sync = NoteSyncController(self)
+        self.note_sync.status_changed.connect(self._sync_status_changed)
+        self._sync_status_changed(self.note_sync.status)
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -1839,6 +2452,7 @@ class HistoryWindow(QWidget):
         self._active_note = 0
         self._renumbering = False  # our own rewrite must not re-trigger itself
         self._note_slots = []     # settings slot behind each tab, in strip order
+        self._note_ids = []       # portable identity, independent of local slot numbers
         self._note_titles = []    # as stored: empty means "use the position"
         self._note_colors = []
         self._saved_notes = []
@@ -1927,6 +2541,13 @@ class HistoryWindow(QWidget):
         self._panel_keys = hint_label("")
         box.addWidget(self._panel_hint)
         box.addWidget(self._panel_keys)
+        self._sync_button = QToolButton()
+        self._sync_button.setText("Notes: Local only")
+        self._sync_button.setStyleSheet("QToolButton { border:none; color:#9aa5b5; padding:2px; text-align:left; }")
+        self._sync_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._sync_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self._sync_button.clicked.connect(self.show_note_sync)
+        box.addWidget(self._sync_button)
         panel.setFixedWidth(self._notepad_width + NOTE_GRIP_WIDTH)
         return panel
 
@@ -1969,10 +2590,10 @@ class HistoryWindow(QWidget):
             QCheckBox#pinNotepad::indicator:hover { border:1px solid #4c8bf5; }
             QCheckBox#pinNotepad::indicator:checked { background:#4c8bf5;
                 border:1px solid #4c8bf5; }
-            QPlainTextEdit#notes { background:#2a2f3a; border:1px solid #3a414f;
-                                   border-radius:8px; padding:6px; font-size:12px;
-                                   selection-background-color:#33405a; }
-            QPlainTextEdit#notes:focus { border:1px solid #4c8bf5; }
+            QTextEdit#notes { background:#2a2f3a; border:1px solid #3a414f;
+                              border-radius:8px; padding:6px; font-size:12px;
+                              selection-background-color:#33405a; }
+            QTextEdit#notes:focus { border:1px solid #4c8bf5; }
             QMenu { background:#2a2f3a; border:1px solid #3a414f; padding:4px; }
             QMenu::item { padding:6px 22px; border-radius:4px; }
             QMenu::item:selected { background:#33405a; }
@@ -2232,10 +2853,129 @@ class HistoryWindow(QWidget):
 
     # ---- notepad -----------------------------------------------------------
 
+    def _sync_status_changed(self, status):
+        self._sync_button.setText("Notes: " + status)
+        self._sync_button.setToolTip(status + "\nClick to configure note sync")
+
+    def show_note_sync(self):
+        self.save_notes()
+        self._menu_open = True
+        dialog = NoteSyncDialog(self.note_sync, self)
+        try:
+            dialog.exec()
+        finally:
+            self._menu_open = False
+            dialog.deleteLater()
+
+    def _note_snapshot(self):
+        return {note: {"text": self._note_edits[i].stored(),
+                       "title": self._note_titles[i], "color": self._note_colors[i],
+                       "position": i} for i, note in enumerate(self._note_ids)}
+
+    def _notes_to_seed(self, current):
+        slots = dict(zip(self._note_ids, self._note_slots))
+        return {key: data for key, data in current.items() if data["text"] or data["title"]
+                or data["color"].lower() != default_note_color(slots[key]).lower()}
+
+    def _apply_synced_notes(self, notes, events):
+        """Commit imports and sync history together; keep untouched editors/undo."""
+        before = self._note_snapshot()
+        ordered = sorted(notes, key=lambda key: (notes[key]["position"], key))
+        if not ordered:
+            # A tombstone must not leave the notepad without an editable tab.
+            old_id = next(iter(before))
+            if (len(before) == 1 and not before[old_id]["text"] and not before[old_id]["title"]
+                    and not any(event["note"] == old_id for event in events.values())):
+                note, notes = old_id, before
+            else:
+                note = uuid.uuid4().hex
+                notes = {note: {"text": "", "title": "", "color": default_note_color(0), "position": 0}}
+            ordered = [note]
+        normalized = {key: {**notes[key], "position": i} for i, key in enumerate(ordered)}
+        if before == normalized and self.note_sync.events == events:
+            return  # steady-state polling must not rewrite the database or undo stacks
+        old_slots = dict(zip(self._note_ids, self._note_slots))
+        slots, taken = {}, {old_slots[key] for key in ordered if key in old_slots}
+        for key in ordered:
+            slot = old_slots.get(key)
+            if slot is None:
+                slot = free_note_slot(taken)
+                taken.add(slot)
+            slots[key] = slot
+        active = self._note_ids[self._active_note]
+        old_active = before[active]
+        # When the active version becomes a conflict copy, follow its contents.
+        if normalized.get(active, {}).get("text") != old_active["text"]:
+            active = next((key for key in ordered if normalized[key]["text"] == old_active["text"]), active)
+        if active not in ordered:
+            active = ordered[0]
+        values = {
+            NOTE_ORDER_KEY: json.dumps([slots[key] for key in ordered]),
+            NOTE_TAB_KEY: str(slots[active]),
+            NOTE_SYNC_STATE_KEY: json.dumps({"events": events, "baseline": normalized}, ensure_ascii=False),
+        }
+        for key in ordered:
+            for base, field in ((NOTE_TEXT_KEY, "text"), (NOTE_TITLE_KEY, "title"), (NOTE_COLOR_KEY, "color")):
+                values[note_key(base, slots[key])] = normalized[key][field]
+            values[note_key(NOTE_ID_KEY, slots[key])] = key
+        with self.db.conn:
+            for key in set(old_slots) - set(ordered):
+                for base in (NOTE_TEXT_KEY, NOTE_TITLE_KEY, NOTE_COLOR_KEY, NOTE_ID_KEY):
+                    self.db.conn.execute("DELETE FROM settings WHERE key = ?", (note_key(base, old_slots[key]),))
+            self.db.conn.executemany("INSERT OR REPLACE INTO settings VALUES (?, ?)", values.items())
+        if before == normalized:
+            return
+        dir_open, dir_fav = self._dir_open, self._dir_fav
+        arrays = (self._note_ids, self._note_slots, self._note_titles, self._note_colors,
+                  self._saved_notes, self._note_tabs, self._note_edits)
+        for i in reversed(range(len(self._note_ids))):
+            if self._note_ids[i] in normalized:
+                continue
+            tab, edit = self._note_tabs[i], self._note_edits[i]
+            self._tabs_row.strip.layout().removeWidget(tab)
+            self._notes_stack.removeWidget(edit)
+            edit.removeEventFilter(self)
+            tab.setParent(None)
+            edit.setParent(None)
+            tab.deleteLater()
+            edit.deleteLater()
+            for row in arrays:
+                row.pop(i)
+        for key in ordered:
+            if key not in self._note_ids:
+                self._create_note(slots[key])
+        indices = [self._note_ids.index(key) for key in ordered]
+        for row in arrays:
+            row[:] = [row[i] for i in indices]
+        for i, key in enumerate(ordered):
+            data, edit = normalized[key], self._note_edits[i]
+            if edit.stored() != data["text"]:
+                cursor = edit.textCursor()
+                position, anchor = cursor.position(), cursor.anchor()
+                scroll = edit.verticalScrollBar().value()
+                edit.blockSignals(True)
+                edit.load(data["text"])
+                end = edit.document().characterCount() - 1
+                cursor = edit.textCursor()
+                cursor.setPosition(min(anchor, end))
+                cursor.setPosition(min(position, end), QTextCursor.MoveMode.KeepAnchor)
+                edit.setTextCursor(cursor)
+                edit.verticalScrollBar().setValue(scroll)
+                edit.blockSignals(False)
+            self._saved_notes[i] = data["text"]
+            self._note_titles[i], self._note_colors[i] = data["title"], data["color"]
+            self._tabs_row.strip.layout().insertWidget(i, self._note_tabs[i])
+        self._show_note(ordered.index(active))
+        if dir_open:
+            self._dir_open, self._dir_fav = True, dir_fav
+            self._notes_stack.setCurrentWidget(self.directory_panel)
+            self._refresh_note_tabs()
+
     def _restore_notepad(self):
         """Rebuild the strip the way it was left: same notes, same order, same width."""
         dir_open = self.db.get_setting(DIR_OPEN_KEY)  # "1" = DIR, "fav" = FAV
-        for slot in clean_note_order(self.db.get_setting(NOTE_ORDER_KEY, "")):
+        limit = 999 if self.db.get_setting(NOTE_SYNC_STATE_KEY) else NOTE_MAX_COUNT
+        for slot in clean_note_order(self.db.get_setting(NOTE_ORDER_KEY, ""), limit):
             self._create_note(slot)
 
         try:
@@ -2262,8 +3002,9 @@ class HistoryWindow(QWidget):
         position = len(self._note_tabs) if position is None else position
         # Normalised up front: every later state is renumbered, so an undo that
         # landed on a crooked list would be renumbered straight back again.
-        text = "\n".join(renumber(
-            self.db.get_setting(note_key(NOTE_TEXT_KEY, slot), "").split("\n")))
+        text = self.db.get_setting(note_key(NOTE_TEXT_KEY, slot), "")
+        if not text.startswith(NOTE_RICH_PREFIX):  # styled notes renumber as they're edited
+            text = "\n".join(renumber(text.split("\n")))
 
         tab = NoteTab(self._tabs_row.strip)
         tab.clicked.connect(lambda _checked=False, t=tab: self._switch_note(self._index_of(t)))
@@ -2273,18 +3014,23 @@ class HistoryWindow(QWidget):
             lambda pos, t=tab: self._note_tab_menu(self._index_of(t), pos))
         tab.drag_moved.connect(lambda where, t=tab: self._drag_note(t, where))
 
-        edit = QPlainTextEdit()
+        edit = NoteEdit()
         edit.setObjectName("notes")
         edit.setPlaceholderText("Jot something down…")
         edit.setTabChangesFocus(True)
         edit.installEventFilter(self)
-        edit.setPlainText(text)
+        edit.load(text)
         edit.textChanged.connect(self._renumber_notes)
         edit.textChanged.connect(self._note_timer_start)
         edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         edit.customContextMenuRequested.connect(self._notes_menu)
 
         self._note_slots.insert(position, slot)
+        note_id = self.db.get_setting(note_key(NOTE_ID_KEY, slot))
+        if not re.fullmatch(r"[0-9a-f]{32}", note_id) or note_id in self._note_ids:
+            note_id = uuid.uuid4().hex
+            self._remember(note_key(NOTE_ID_KEY, slot), note_id)
+        self._note_ids.insert(position, note_id)
         self._note_titles.insert(position, raw_note_title(
             self.db.get_setting(note_key(NOTE_TITLE_KEY, slot), "")))
         self._note_colors.insert(position, clean_note_color(
@@ -2377,6 +3123,7 @@ class HistoryWindow(QWidget):
         tab = self._note_tabs.pop(index)
         edit = self._note_edits.pop(index)
         del self._note_titles[index], self._note_colors[index], self._saved_notes[index]
+        del self._note_ids[index]
 
         self._tabs_row.strip.layout().removeWidget(tab)
         tab.setParent(None)
@@ -2386,7 +3133,7 @@ class HistoryWindow(QWidget):
         edit.setParent(None)
         edit.deleteLater()
 
-        for base in (NOTE_TEXT_KEY, NOTE_TITLE_KEY, NOTE_COLOR_KEY):
+        for base in (NOTE_TEXT_KEY, NOTE_TITLE_KEY, NOTE_COLOR_KEY, NOTE_ID_KEY):
             self._forget(note_key(base, slot))
         self._save_note_order()
 
@@ -2440,7 +3187,7 @@ class HistoryWindow(QWidget):
         """Move one tab along the strip, carrying its note and its colour."""
         if source == target:
             return
-        for row in (self._note_slots, self._note_titles, self._note_colors,
+        for row in (self._note_slots, self._note_ids, self._note_titles, self._note_colors,
                     self._saved_notes, self._note_tabs, self._note_edits):
             row.insert(target, row.pop(source))
         layout = self._tabs_row.strip.layout()
@@ -2670,15 +3417,58 @@ class HistoryWindow(QWidget):
         self._note_timer.stop()
         idx = self._active_note
         slot = self._note_slots[idx]
-        text = self.notes.toPlainText()
-        if text != self._saved_notes[idx] and self._remember(note_key(NOTE_TEXT_KEY, slot), text):
-            self._saved_notes[idx] = text
+        text = self.notes.stored()
+        if text == self._saved_notes[idx]:
+            return True
+        if not self._remember(note_key(NOTE_TEXT_KEY, slot), text):
+            return False
+        self._saved_notes[idx] = text
+        return True
 
     # ---- notepad formatting ------------------------------------------------
 
     def _notes_menu(self, pos):
-        """Right-click in the pad: the usual editing menu plus list formatting."""
+        """Right-click in the pad: the usual editing menu plus text and list formatting."""
+        if not self.notes.textCursor().hasSelection():
+            # Nothing selected: styles land on the word that was right-clicked.
+            self.notes.setTextCursor(self.notes.cursorForPosition(pos))
         menu = self.notes.createStandardContextMenu()
+        menu.addSeparator()
+
+        highlight = menu.addMenu("Highlight")
+        current = self.notes.textCursor().charFormat().background()
+        for label, colour in NOTE_HIGHLIGHTS:
+            action = highlight.addAction(swatch(colour), label,
+                                         lambda c=colour: self._highlight(c))
+            action.setCheckable(True)
+            action.setChecked(current.style() != Qt.BrushStyle.NoBrush
+                              and current.color().name() == colour)
+        highlight.addSeparator()
+        highlight.addAction("No highlight", lambda: self._highlight(None))
+
+        style = menu.addMenu("Text style")
+        level = self.notes.textCursor().blockFormat().headingLevel()
+        for number, label in enumerate(("Normal", "Heading 1", "Heading 2", "Heading 3")):
+            action = style.addAction(label, lambda n=number: self._set_heading(n))
+            action.setShortcut(QKeySequence(f"Ctrl+Alt+{number}"))
+            action.setCheckable(True)
+            action.setChecked(number == level)
+
+        sizes = menu.addMenu("Font size")
+        here = self._font_size()
+        default = sizes.addAction("Default", lambda: self._set_font_size(None))
+        default.setCheckable(True)
+        default.setChecked(here is None)
+        sizes.addSeparator()
+        for points in NOTE_FONT_SIZES:
+            action = sizes.addAction(str(points), lambda p=points: self._set_font_size(p))
+            action.setCheckable(True)
+            action.setChecked(here == points)
+        sizes.addSeparator()
+        sizes.addAction("Bigger", lambda: self._step_font_size(1)).setShortcut(
+            QKeySequence("Ctrl+]"))
+        sizes.addAction("Smaller", lambda: self._step_font_size(-1)).setShortcut(
+            QKeySequence("Ctrl+["))
         menu.addSeparator()
         for label, keys, style in (
             ("Bullet list", "Ctrl+Shift+8", "bullet"),
@@ -2773,6 +3563,138 @@ class HistoryWindow(QWidget):
     def _insert_timestamp(self):
         self.notes.insertPlainText(time.strftime(NOTE_STAMP_FORMAT))
 
+    # ---- notepad text styles -----------------------------------------------
+
+    def _styled_range(self):
+        """A cursor over the selection, else over the word at the caret."""
+        cursor = self.notes.textCursor()
+        if not cursor.hasSelection():
+            cursor.select(QTextCursor.SelectionType.WordUnderCursor)
+        return cursor
+
+    def _strip_format(self, cursor, props):
+        """Remove ``props`` from every character ``cursor`` selects."""
+        doc = self.notes.document()
+        start, end = cursor.selectionStart(), cursor.selectionEnd()
+        runs, block = [], doc.findBlock(start)
+        while block.isValid() and block.position() <= end:
+            for part in block.textFormats():
+                low = max(start, block.position() + part.start)
+                high = min(end, block.position() + part.start + part.length)
+                if low < high:
+                    runs.append((low, high, QTextCharFormat(part.format)))  # outlive the list
+            block = block.next()
+        # Collected first: restyling a run splits and merges the ones around it.
+        for low, high, fmt in runs:
+            for prop in props:
+                fmt.clearProperty(prop)
+            run = QTextCursor(doc)
+            run.setPosition(low)
+            run.setPosition(high, QTextCursor.MoveMode.KeepAnchor)
+            run.setCharFormat(fmt)
+
+    def _restyle(self, props=(), merge=None):
+        """Clear ``props`` then merge ``merge`` into the selection (or the word
+        at the caret), as one undo step. With neither, it styles what's typed next."""
+        cursor = self._styled_range()
+        if not cursor.hasSelection():
+            fmt = self.notes.currentCharFormat()
+            for prop in props:
+                fmt.clearProperty(prop)
+            if merge is not None:
+                fmt.merge(merge)
+            self.notes.setCurrentCharFormat(fmt)
+            return
+        cursor.beginEditBlock()
+        self._strip_format(cursor, props)
+        if merge is not None:
+            cursor.mergeCharFormat(merge)
+        cursor.endEditBlock()
+
+    def _highlight(self, colour):
+        """Mark text red, yellow or green like a highlighter; ``None`` rubs it out."""
+        if colour is None:
+            self._restyle(HIGHLIGHT_PROPS)
+            return
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor(colour))
+        fmt.setForeground(QColor(NOTE_HIGHLIGHT_INK))
+        self._restyle(merge=fmt)
+
+    def _font_size(self):
+        """The size at the caret in points, or ``None`` for the pad's default."""
+        fmt = self.notes.textCursor().charFormat()
+        if fmt.hasProperty(QTextFormat.Property.FontPointSize):
+            return round(fmt.fontPointSize())
+        pixels = fmt.property(QTextFormat.Property.FontPixelSize)
+        return None if pixels in (None, NOTE_BODY_PX) else px_to_pt(pixels)
+
+    def _set_font_size(self, points):
+        fmt = None
+        if points is not None:
+            fmt = QTextCharFormat()
+            fmt.setProperty(QTextFormat.Property.FontPixelSize, pt_to_px(points))
+        self._restyle(SIZE_PROPS, fmt)
+
+    def _step_font_size(self, step):
+        """Word's Ctrl+] / Ctrl+[: one size up or down the size list."""
+        here = self._font_size() or px_to_pt(NOTE_BODY_PX)
+        if step > 0:
+            bigger = [p for p in NOTE_FONT_SIZES if p > here]
+            self._set_font_size(bigger[0] if bigger else NOTE_FONT_SIZES[-1])
+        else:
+            smaller = [p for p in NOTE_FONT_SIZES if p < here]
+            self._set_font_size(smaller[-1] if smaller else NOTE_FONT_SIZES[0])
+
+    def _set_heading(self, level):
+        """Heading 1-3, or back to Normal, for every line the cursor touches."""
+        doc = self.notes.document()
+        blocks = self._note_blocks()
+        heading = None
+        if level:
+            heading = QTextCharFormat()
+            heading.setProperty(QTextFormat.Property.FontPixelSize,
+                                pt_to_px(NOTE_HEADING_PT[level]))
+            heading.setFontWeight(QFont.Weight.Bold)
+        edit = QTextCursor(doc)
+        edit.beginEditBlock()
+        for number in blocks:
+            block = doc.findBlockByNumber(number)
+            edit.setPosition(block.position())
+            fmt = block.blockFormat()
+            fmt.setHeadingLevel(level)
+            edit.setBlockFormat(fmt)
+            # The block's own char format is what an emptied line types in.
+            empty = block.charFormat()
+            for prop in (*SIZE_PROPS, QTextFormat.Property.FontWeight):
+                empty.clearProperty(prop)
+            if heading is not None:
+                empty.merge(heading)
+            edit.setBlockCharFormat(empty)
+            edit.setPosition(block.position() + block.length() - 1,
+                             QTextCursor.MoveMode.KeepAnchor)
+            self._strip_format(edit, (*SIZE_PROPS, QTextFormat.Property.FontWeight))
+            if heading is not None:
+                edit.mergeCharFormat(heading)
+        edit.endEditBlock()
+        caret = self.notes.textCursor()
+        if not caret.hasSelection():  # with one, this would restyle the selection
+            self.notes.setCurrentCharFormat(caret.charFormat())  # keep typing in the new style
+
+    def _leave_heading(self):
+        """Enter at the end of a heading starts a Normal line, as in Word.
+
+        Returns whether the key was handled.
+        """
+        cursor = self.notes.textCursor()
+        if (cursor.hasSelection() or not cursor.blockFormat().headingLevel()
+                or not cursor.atBlockEnd()):
+            return False
+        cursor.insertBlock(QTextBlockFormat(), QTextCharFormat())
+        self.notes.setTextCursor(cursor)
+        self.notes.setCurrentCharFormat(QTextCharFormat())
+        return True
+
     def _continue_list(self):
         """Enter carries the marker to the next line; on an empty one, ends the list.
 
@@ -2799,6 +3721,10 @@ class HistoryWindow(QWidget):
     def _remember(self, key, value):
         try:
             self.db.set_setting(key, value)
+            if hasattr(self, "note_sync") and (key == NOTE_ORDER_KEY or any(
+                    key == base or key.startswith(base + "_")
+                    for base in (NOTE_TEXT_KEY, NOTE_TITLE_KEY, NOTE_COLOR_KEY))):
+                self.note_sync.changed()
             return True
         except sqlite3.Error:
             logger.exception("Could not save setting %s", key)
@@ -2969,11 +3895,18 @@ class HistoryWindow(QWidget):
                     if key == Qt.Key.Key_X:
                         self._toggle_done()
                         return True
+                alt = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+                if ctrl and alt and not shift and key in self.HEADING_KEYS:
+                    self._set_heading(self.HEADING_KEYS[key])
+                    return True
+                if ctrl and not alt and key in (Qt.Key.Key_BracketRight, Qt.Key.Key_BracketLeft):
+                    self._step_font_size(1 if key == Qt.Key.Key_BracketRight else -1)
+                    return True
                 if key == Qt.Key.Key_F5:
                     self._insert_timestamp()
                     return True
-                if (key in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
-                        and not ctrl and not shift and self._continue_list()):
+                if (key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not ctrl and not shift
+                        and (self._continue_list() or self._leave_heading())):
                     return True
                 return super().eventFilter(obj, event)
 
@@ -3105,7 +4038,11 @@ def main():
 
     instance = SingleInstance()
     if instance.already_running:
-        logger.info("A PyClip instance is already running; duplicate launch stopped")
+        if STARTUP_FLAG not in sys.argv or "--show" in sys.argv:
+            instance.request_activation()
+            logger.info("Asked the running PyClip instance to show its window")
+        else:
+            logger.info("A PyClip instance is already running; duplicate startup stopped")
         instance.close()
         return 0
 
@@ -3128,6 +4065,16 @@ def main():
         return 1
     monitor = ClipboardMonitor(db)
     window = HistoryWindow(db)
+    activation_timer = QTimer(window)
+    activation_timer.setInterval(200)
+
+    def activate_existing():
+        if instance.take_activation():
+            logger.info("Showing PyClip after another manual launch")
+            window.show_popup()
+
+    activation_timer.timeout.connect(activate_existing)
+    activation_timer.start()
     icon = make_icon()
 
     def on_clip_added():
@@ -3219,6 +4166,7 @@ def main():
 
     menu = QMenu()
     menu.addAction("Open clipboard history", window.show_popup)
+    menu.addAction("Note sync…", window.show_note_sync)
     menu.addSeparator()
 
     startup_action = menu.addAction("Start with Windows")
@@ -3271,8 +4219,10 @@ def main():
         if cleaned_up:
             return
         cleaned_up = True
+        activation_timer.stop()
         hotkey.unregister()
         window.save_notes()
+        window.note_sync.stop()
         db.close()
         instance.close()
         logger.info("PyClip stopped cleanly")
@@ -3282,10 +4232,8 @@ def main():
     at_startup = STARTUP_FLAG in sys.argv
     logger.info("PyClip ready (hotkey registered=%s, pinned=%s, at startup=%s)",
                 hotkey.registered, window._notepad_pinned, at_startup)
-    # A pinned notepad is meant to remain visible between sessions, but a
-    # launch by Windows at login always stays in the tray. Ordinary launches
-    # stay in the tray too; --show explicitly opens the window.
-    if (window._notepad_pinned and not at_startup) or "--show" in sys.argv:
+    # Double-clicks open the window; Windows login launches stay in the tray.
+    if not at_startup or "--show" in sys.argv:
         QTimer.singleShot(0, window.show_popup)
 
     if hotkey.registered:
