@@ -72,6 +72,10 @@ NOTE_TEXT_KEY = "notepad_text"
 NOTE_TITLE_KEY = "notepad_title"
 NOTE_COLOR_KEY = "notepad_color"
 NOTE_ID_KEY = "notepad_sync_id"
+NOTE_LOCAL_KEY = "notepad_local"
+NOTE_SYNC_EXCLUDED_KEY = "notepad_sync_excluded"
+NOTE_SYNC_MOVES_KEY = "notepad_sync_local_moves"
+NOTE_SYNC_WITHDRAWN_KEY = "notepad_sync_withdrawn"
 NOTE_SYNC_CONFIG_KEY = "notepad_sync_config"
 NOTE_SYNC_STATE_KEY = "notepad_sync_state"
 NOTE_SYNC_INTERVAL_MS = 15000
@@ -401,10 +405,13 @@ class Database:
                 preview    TEXT,                   -- short label shown in the list
                 hash       TEXT UNIQUE,            -- de-duplication key
                 pinned     INTEGER DEFAULT 0,
+                reuse_added_at REAL,
                 created_at REAL
             )
             """
         )
+        if "reuse_added_at" not in {row[1] for row in self.conn.execute("PRAGMA table_info(clips)")}:
+            self.conn.execute("ALTER TABLE clips ADD COLUMN reuse_added_at REAL")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON clips(created_at)")
         self.conn.execute(
             """
@@ -532,18 +539,32 @@ class Database:
         return {row[0] for row in
                 self.conn.execute("SELECT path_key FROM favorite_directories")}
 
-    def get_clips(self, search=None, limit=500, include_content=True):
+    def set_reuse(self, clip_ids, enabled=True):
+        """Save membership on the original clip, without duplicating its payload."""
+        with self.conn:
+            self.conn.executemany(
+                "UPDATE clips SET reuse_added_at = COALESCE(reuse_added_at, ?) WHERE id = ?"
+                if enabled else "UPDATE clips SET reuse_added_at = ? WHERE id = ?",
+                ((time.time() if enabled else None, clip_id) for clip_id in clip_ids))
+
+    def get_clips(self, search=None, limit=500, include_content=True, reuse_only=False):
         params = []
         columns = "*" if include_content else (
-            "id, kind, data, preview, hash, pinned, created_at, "
+            "id, kind, data, preview, hash, pinned, reuse_added_at, created_at, "
             "length(CAST(COALESCE(text, '') AS BLOB)) AS text_bytes"
         )
         query = f"SELECT {columns} FROM clips"
+        filters = ["reuse_added_at IS NOT NULL"] if reuse_only else []
         if search:
-            query += " WHERE preview LIKE ? OR text LIKE ?"
+            filters.append("(preview LIKE ? OR text LIKE ?)")
             params += [f"%{search}%", f"%{search}%"]
-        query += " ORDER BY pinned DESC, created_at DESC LIMIT ?"
-        params.append(limit)
+        if filters:
+            query += " WHERE " + " AND ".join(filters)
+        query += (" ORDER BY reuse_added_at, id" if reuse_only else
+                  " ORDER BY pinned DESC, created_at DESC")
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
         return self.conn.execute(query, params).fetchall()
 
     def get_one(self, clip_id):
@@ -552,7 +573,7 @@ class Database:
     def storage_entries(self):
         """Measure saved payloads without loading full text or decoding images."""
         rows = self.conn.execute(
-            "SELECT id, kind, data, pinned, created_at, "
+            "SELECT id, kind, data, pinned, reuse_added_at, created_at, "
             "length(CAST(COALESCE(text, '') AS BLOB)) AS text_bytes FROM clips"
         ).fetchall()
         return [dict(row, size_bytes=clip_size_bytes(row) or 0) for row in rows]
@@ -564,7 +585,8 @@ class Database:
         for entry in sorted(entries, key=lambda row: (-row["size_bytes"], row["id"])):
             if total <= target_bytes or entry["size_bytes"] < minimum_bytes:
                 break
-            if (CLEANUP_KEEP_PINNED and entry["pinned"]) or not entry["size_bytes"]:
+            if (entry["reuse_added_at"] is not None
+                    or (CLEANUP_KEEP_PINNED and entry["pinned"]) or not entry["size_bytes"]):
                 continue
             removed.append(entry)
             total -= entry["size_bytes"]
@@ -606,7 +628,7 @@ class Database:
         self.conn.commit()
 
     def clear(self, keep_pinned=True):
-        where = " WHERE pinned = 0" if keep_pinned else ""
+        where = " WHERE pinned = 0 AND reuse_added_at IS NULL" if keep_pinned else ""
         rows = self.conn.execute("SELECT kind, data FROM clips" + where).fetchall()
         with self.conn:
             self.conn.execute("DELETE FROM clips" + where)
@@ -616,7 +638,8 @@ class Database:
     def enforce_limit(self, max_items=300):
         """Trim un-pinned history to ``max_items`` newest entries."""
         rows = self.conn.execute(
-            "SELECT id, kind, data FROM clips WHERE pinned = 0 ORDER BY created_at DESC"
+            "SELECT id, kind, data FROM clips WHERE pinned = 0 AND reuse_added_at IS NULL "
+            "ORDER BY created_at DESC"
         ).fetchall()
         expired = rows[max_items:]
         with self.conn:
@@ -1124,6 +1147,8 @@ class ClipDelegate(QStyledItemDelegate):
         meta = data.get("meta", "")
         if data.get("pinned"):
             meta = "\U0001F4CC  " + meta
+        if data.get("reusable"):
+            meta = "★  " + meta
         painter.setPen(QColor("#8a909c"))
         mf = QFont(); mf.setPointSize(8)
         painter.setFont(mf)
@@ -1703,10 +1728,10 @@ class WindowEdgeGrip(QWidget):
 
 
 class NoteResizeGrip(QWidget):
-    """The grip down the pad's left edge; dragging it sets the pad's width.
+    """Redistribute space between clipboard and notes inside the window.
 
-    The window grows leftwards as the pad widens, so the grip stays under the
-    cursor instead of sliding away from it. Double-click returns to the default.
+    In notepad-only mode it resizes the pad from the left instead.
+    Double-click returns the section to its default width.
     """
 
     drag_started = Signal()
@@ -1720,7 +1745,7 @@ class NoteResizeGrip(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFixedWidth(NOTE_GRIP_WIDTH)
         self.setCursor(Qt.CursorShape.SizeHorCursor)
-        self.setToolTip("Drag to resize the notepad  (double-click to reset)")
+        self.setToolTip("Drag to adjust space between clipboard and notes  (double-click to reset)")
         self._origin = None
 
     def mousePressEvent(self, event):
@@ -1801,6 +1826,53 @@ class NoteSyncJournal:
     MAX_FILE_BYTES = 8 * 1024 * 1024
     MAX_TOTAL_BYTES = 128 * 1024 * 1024
     MAX_EVENTS = 25000
+
+    class Result(dict):
+        def __init__(self, events, withdrawn=()):
+            super().__init__(events)
+            self.withdrawn = set(withdrawn)
+            self.completed_moves = {}
+
+    @staticmethod
+    def write_atomic(path, raw, cancelled):
+        fd, temporary = tempfile.mkstemp(prefix=".pyclip-", suffix=".tmp", dir=os.path.dirname(path))
+        try:
+            with os.fdopen(fd, "wb") as target:
+                target.write(raw)
+                target.flush()
+                os.fsync(target.fileno())
+            if cancelled.is_set():
+                return False
+            os.replace(temporary, path)
+            return True
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    @classmethod
+    def withdrawals(cls, folder):
+        """Permanent, content-free records prevent stale PCs re-uploading private notes."""
+        directory = os.path.join(folder, NOTE_SYNC_FOLDER, "local-only")
+        withdrawn = set()
+        if not os.path.isdir(directory):
+            return withdrawn
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if not entry.name.lower().endswith(".json"):
+                    continue
+                filename = re.fullmatch(r"([0-9a-f]{32})(?:[ ._(-].*)?\.json", entry.name, re.IGNORECASE)
+                if not filename or entry.is_symlink() or entry.stat().st_size > 4096:
+                    raise ValueError("Invalid local-only removal record; original files were kept.")
+                with open(entry.path, "rb") as source:
+                    raw = source.read(4097)
+                record = json.loads(raw)
+                expected = {"schema": 1, "note": filename.group(1).lower(), "action": "local-only"}
+                if len(raw) > 4096 or record != expected:
+                    raise ValueError("Invalid local-only removal record; original files were kept.")
+                withdrawn.add(expected["note"])
+                if len(withdrawn) > cls.MAX_EVENTS:
+                    raise ValueError("Too many local-only removal records.")
+        return withdrawn
 
     @staticmethod
     def encode(value):
@@ -1891,26 +1963,38 @@ class NoteSyncJournal:
         return events, notes
 
     @classmethod
-    def exchange(cls, folder, local, cancelled, cache):
+    def exchange(cls, folder, local, cancelled, cache, withdraw=(), archive_dir=None):
         """Runs only on a worker thread. Atomic files; never share the SQLite DB."""
         if not os.path.isdir(folder):
             raise OSError("The selected folder is unavailable. Reconnect the drive or choose another folder.")
         destination = os.path.join(folder, NOTE_SYNC_FOLDER, "revisions")
         os.makedirs(destination, exist_ok=True)
-        events = dict(local)
-        present, total = set(), 0
+        requested = set(withdraw)
+        if any(not isinstance(note, str) or not re.fullmatch(r"[0-9a-f]{32}", note) for note in requested):
+            raise ValueError("Invalid local-only note identifier.")
+        withdrawn = cls.withdrawals(folder)
+        events, revision_files = dict(local), []
+        present, total, file_count = set(), 0, 0
         with os.scandir(destination) as entries:
             for entry in entries:
                 if cancelled.is_set():
                     return None
-                if not entry.name.endswith(".json"):
+                if not entry.name.lower().endswith(".json"):
                     continue  # unfinished atomic writes are never imported
-                if not re.fullmatch(r"[0-9a-f]{64}\.json", entry.name):
-                    raise ValueError("An unexpected revision file needs review in the sync folder.")
+                # Cloud clients can add numbers, device names or conflict/copy
+                # suffixes. The hash must still be the first complete token,
+                # and must match the verified contents before anything is used.
+                filename = re.fullmatch(r"([0-9a-f]{64})(?:[ ._(-].*)?\.json", entry.name,
+                                        re.IGNORECASE)
+                if not filename:
+                    raise ValueError(f"An unexpected revision file needs review: {entry.name}")
+                if entry.is_symlink():
+                    raise ValueError("Revision links are not supported; original files were kept.")
                 stat = entry.stat()
                 total += stat.st_size
+                file_count += 1
                 if (stat.st_size > cls.MAX_FILE_BYTES or total > cls.MAX_TOTAL_BYTES
-                        or len(present) >= cls.MAX_EVENTS):
+                        or file_count > cls.MAX_EVENTS):
                     raise ValueError("The sync history is too large. Choose a new folder to start a fresh history.")
                 stamp = (stat.st_size, stat.st_mtime_ns)
                 cached = cache.get(entry.name)
@@ -1923,22 +2007,86 @@ class NoteSyncJournal:
                         raise ValueError("A note revision is too large.")
                     event = cls.validate(json.loads(raw))
                     cache[entry.name] = (stamp, event)
-                if entry.name != event["id"] + ".json":
+                if filename.group(1).lower() != event["id"]:
                     raise ValueError("A revision filename does not match its content.")
                 events[event["id"]] = event
-                present.add(event["id"])
-        cls.heads(events)  # wait for complete histories before applying or publishing
-        outgoing = {key: cls.encode(event) for key, event in local.items() if key not in present}
-        if len(events) > cls.MAX_EVENTS or total + sum(map(len, outgoing.values())) > cls.MAX_TOTAL_BYTES:
-            raise ValueError("The sync history is too large. Choose a new folder to start a fresh history.")
-        for key, event in local.items():
+                revision_files.append((entry.path, entry.name, event, stamp))
+                if entry.name == event["id"] + ".json":
+                    present.add(event["id"])
+        if cancelled.is_set():
+            return None
+        if requested:
+            # Archive and verify every shared revision before publishing a removal
+            # record or removing a file. A failed/offline move leaves originals intact.
+            archive_dir = archive_dir or os.path.join(APP_DIR, "local-note-revisions")
+            archive_root = os.path.normcase(os.path.realpath(archive_dir))
+            shared_root = os.path.normcase(os.path.realpath(folder))
+            try:
+                inside_shared = os.path.commonpath([archive_root, shared_root]) == shared_root
+            except ValueError:
+                inside_shared = False  # different Windows drives
+            if inside_shared:
+                raise OSError("Local note storage must be outside the shared folder.")
+            folder_id = hashlib.sha256(shared_root.encode("utf-8")).hexdigest()[:16]
+            for path, name, event, stamp in revision_files:
+                if event["note"] not in requested:
+                    continue
+                if cancelled.is_set():
+                    return None
+                with open(path, "rb") as source:
+                    raw = source.read(cls.MAX_FILE_BYTES + 1)
+                if len(raw) > cls.MAX_FILE_BYTES or cls.validate(json.loads(raw)) != event:
+                    raise OSError("A shared revision changed during the local move; retrying.")
+                archive = os.path.join(archive_root, folder_id, event["note"])
+                os.makedirs(archive, exist_ok=True)
+                archived = os.path.join(archive, hashlib.sha256(raw).hexdigest() + ".json")
+                if not cls.write_atomic(archived, raw, cancelled):
+                    return None
+                with open(archived, "rb") as source:
+                    if source.read(cls.MAX_FILE_BYTES + 1) != raw:
+                        raise OSError("The local revision archive could not be verified; shared files were kept.")
+            directory = os.path.join(folder, NOTE_SYNC_FOLDER, "local-only")
+            os.makedirs(directory, exist_ok=True)
+            for note in sorted(requested - withdrawn):
+                record = {"schema": 1, "note": note, "action": "local-only"}
+                if not cls.write_atomic(os.path.join(directory, note + ".json"), cls.encode(record), cancelled):
+                    return None
+            withdrawn.update(requested)
+        # Catch records written by another PC while the directory was being read.
+        withdrawn.update(cls.withdrawals(folder))
+        for path, name, event, stamp in revision_files:
+            if event["note"] not in withdrawn:
+                continue
             if cancelled.is_set():
                 return None
-            if key in present:
-                continue
-            raw = outgoing[key]
+            try:
+                stat = os.stat(path)
+                if (stat.st_size, stat.st_mtime_ns) != stamp:
+                    raise OSError("A shared revision changed during removal; retrying.")
+                os.unlink(path)
+            except FileNotFoundError:
+                pass  # another updated PC finished the same removal
+            cache.pop(name, None)
+            total -= stamp[0]
+            file_count -= 1
+        events = {key: event for key, event in events.items() if event["note"] not in withdrawn}
+        present.intersection_update(events)
+        cls.heads(events)  # wait for complete histories before applying or publishing
+        # Restore a canonical filename if only a renamed copy arrived. Keep all
+        # existing files, and publish each revision once regardless of copy count.
+        outgoing = {key: cls.encode(event) for key, event in events.items() if key not in present}
+        if (len(events) > cls.MAX_EVENTS or file_count + len(outgoing) > cls.MAX_EVENTS
+                or total + sum(map(len, outgoing.values())) > cls.MAX_TOTAL_BYTES):
+            raise ValueError("The sync history is too large. Choose a new folder to start a fresh history.")
+        for key, raw in outgoing.items():
+            if cancelled.is_set():
+                return None
             if len(raw) > cls.MAX_FILE_BYTES:
                 raise ValueError("A note is too large to sync; it is still saved locally.")
+            marker = os.path.join(folder, NOTE_SYNC_FOLDER, "local-only", events[key]["note"] + ".json")
+            if os.path.exists(marker):
+                # Retry with the new record rather than publishing an obsolete snapshot.
+                raise OSError("A tab changed to local-only on another PC; retrying.")
             fd, temporary = tempfile.mkstemp(prefix=".pyclip-", suffix=".tmp", dir=destination)
             try:
                 with os.fdopen(fd, "wb") as target:
@@ -1951,7 +2099,7 @@ class NoteSyncJournal:
             finally:
                 if os.path.exists(temporary):
                     os.unlink(temporary)
-        return events
+        return cls.Result(events, withdrawn)
 
 
 class NoteSyncController(QObject):
@@ -1962,6 +2110,9 @@ class NoteSyncController(QObject):
         super().__init__(window)
         self.window, self.db = window, window.db
         self.events, self.baseline, self.config = {}, {}, {"provider": "local", "folder": ""}
+        self.excluded = self.window._local_note_ids()
+        self.withdrawn = set()
+        self.pending_moves = {}
         self.status = "Local only"
         self.busy = False
         self.generation = 0
@@ -1972,6 +2123,22 @@ class NoteSyncController(QObject):
         self.load_error = False
         self.initialized = False
         try:
+            excluded = json.loads(self.db.get_setting(NOTE_SYNC_EXCLUDED_KEY, "[]"))
+            if (not isinstance(excluded, list) or any(not isinstance(note, str)
+                    or not re.fullmatch(r"[0-9a-f]{32}", note) for note in excluded)):
+                raise ValueError("Invalid local-only note settings.")
+            self.excluded.update(excluded)
+            withdrawn = json.loads(self.db.get_setting(NOTE_SYNC_WITHDRAWN_KEY, "[]"))
+            moves = json.loads(self.db.get_setting(NOTE_SYNC_MOVES_KEY, "{}"))
+            if (not isinstance(withdrawn, list) or not isinstance(moves, dict)
+                    or any(not isinstance(folder, str) or not folder or not isinstance(notes, list)
+                           for folder, notes in moves.items())):
+                raise ValueError("Invalid pending local note moves.")
+            identifiers = withdrawn + [note for notes in moves.values() for note in notes]
+            if any(not isinstance(note, str) or not re.fullmatch(r"[0-9a-f]{32}", note) for note in identifiers):
+                raise ValueError("Invalid pending local note moves.")
+            self.withdrawn = set(withdrawn)
+            self.pending_moves = {folder: set(notes) for folder, notes in moves.items() if notes}
             config = json.loads(self.db.get_setting(NOTE_SYNC_CONFIG_KEY, "{}"))
             if (not isinstance(config, dict)
                     or config.get("provider", "local") not in ("local", "google", "dropbox", "folder")
@@ -1991,7 +2158,11 @@ class NoteSyncController(QObject):
                 if data is None:
                     raise ValueError("Invalid local note snapshot.")
                 NoteSyncJournal.validate(NoteSyncJournal.revision(note, [], data))
-        except (ValueError, TypeError, AttributeError):
+            # Apply the new move semantics to tabs already marked local in older versions.
+            if self.config["folder"] and self.window._local_note_ids():
+                self.pending_moves.setdefault(self.config["folder"], set()).update(self.window._local_note_ids())
+                self.db.set_setting(NOTE_SYNC_MOVES_KEY, self.moves_json(self.pending_moves))
+        except (ValueError, TypeError, AttributeError, sqlite3.Error):
             self.load_error = True
             self.set_status("Local sync history needs repair; notes are saved locally")
         self.timer = QTimer(self)
@@ -2006,9 +2177,13 @@ class NoteSyncController(QObject):
         self.apply_timer.setInterval(1000)
         self.apply_timer.timeout.connect(self.apply_pending)
         self.completed.connect(self.receive)
-        if self.enabled:
+        if self.enabled or self.pending_moves:
             self.timer.start()
             self.debounce.start()
+
+    @staticmethod
+    def moves_json(moves):
+        return json.dumps({folder: sorted(notes) for folder, notes in moves.items() if notes})
 
     @property
     def enabled(self):
@@ -2022,7 +2197,7 @@ class NoteSyncController(QObject):
         """Capture on the GUI thread; the worker never touches widgets or SQLite."""
         if self.load_error:
             return
-        current = self.window._note_snapshot()
+        current = self.window._note_snapshot(synced_only=True)
         if not self.initialized:
             self.baseline = {}
             # Do not add five unused starter tabs when joining an existing folder.
@@ -2032,6 +2207,8 @@ class NoteSyncController(QObject):
         heads = NoteSyncJournal.heads(self.events)
         updated = dict(self.events)
         for note in set(seed) | set(self.baseline):
+            if note in self.excluded or note in self.withdrawn:
+                continue  # removed shared identities must never be recreated
             data = seed.get(note)
             if data == self.baseline.get(note):
                 continue
@@ -2047,8 +2224,69 @@ class NoteSyncController(QObject):
             self.initialized = True
 
     def changed(self):
-        if self.enabled and not self.stopped:
+        if (self.enabled or self.pending_moves) and not self.stopped:
+            if self.pending_moves:
+                self.timer.start()
             self.debounce.start()
+
+    def outgoing_events(self):
+        """Private tabs, including previously queued revisions, never leave this PC."""
+        return {key: event for key, event in self.events.items()
+                if event["note"] not in self.excluded | self.withdrawn}
+
+    def set_note_local(self, index, local):
+        """Persist the privacy choice before changing widgets or restarting sync."""
+        local = bool(local)
+        if self.window._note_local[index] == local:
+            return True
+        if not self.window.save_notes():
+            return False
+        note = self.window._note_ids[index]
+        excluded = self.excluded | {note}
+        withdrawn = self.withdrawn | {note} if local else set(self.withdrawn)
+        moves = {folder: set(notes) for folder, notes in self.pending_moves.items()}
+        if local and self.config["folder"]:
+            moves.setdefault(self.config["folder"], set()).add(note)
+        # Sharing again uses a fresh identity; the old removal record remains permanent.
+        new_note = note if local else uuid.uuid4().hex
+        # Drop any unpublished history for this tab when making it private.
+        # The current private contents remain in the local notes database.
+        events = {key: event for key, event in self.events.items()
+                  if not local or event["note"] != note}
+        baseline = {key: data for key, data in self.baseline.items() if key != note}
+        try:
+            with self.db.conn:
+                self.db.conn.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)",
+                                     (note_key(NOTE_LOCAL_KEY, self.window._note_slots[index]),
+                                      "1" if local else "0"))
+                self.db.conn.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)",
+                                     (NOTE_SYNC_EXCLUDED_KEY, json.dumps(sorted(excluded))))
+                self.db.conn.executemany("INSERT OR REPLACE INTO settings VALUES (?, ?)", (
+                    (NOTE_SYNC_MOVES_KEY, self.moves_json(moves)),
+                    (NOTE_SYNC_WITHDRAWN_KEY, json.dumps(sorted(withdrawn))),
+                    (note_key(NOTE_ID_KEY, self.window._note_slots[index]), new_note)))
+                if self.initialized:
+                    self.db.conn.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)",
+                                         (NOTE_SYNC_STATE_KEY, json.dumps(
+                                             {"events": events, "baseline": baseline}, ensure_ascii=False)))
+        except sqlite3.Error:
+            logger.exception("Could not change note privacy")
+            self.set_status("Could not save tab storage setting · retry")
+            return False
+        self.cancelled.set()
+        self.cancelled = threading.Event()
+        self.generation += 1
+        self.pending = None
+        self.apply_timer.stop()
+        self.events, self.baseline, self.excluded = events, baseline, excluded
+        self.withdrawn, self.pending_moves = withdrawn, moves
+        self.window._note_ids[index] = new_note
+        self.window._note_local[index] = local
+        self.window._refresh_note_tabs()
+        if moves:
+            self.set_status("Saved locally · moving shared revisions to this computer…")
+        self.changed()
+        return True
 
     def configure(self, provider, folder):
         if not self.window.save_notes():
@@ -2058,10 +2296,13 @@ class NoteSyncController(QObject):
         if provider == "local" and not folder:
             folder = self.config.get("folder", "")
         config = {"provider": provider, "folder": folder}
+        moves = {path: set(notes) for path, notes in self.pending_moves.items()}
+        if folder and self.window._local_note_ids():
+            moves.setdefault(folder, set()).update(self.window._local_note_ids())
         # A different folder starts with just the current notes, not old/deleted history.
         different = (provider != "local" and os.path.normcase(folder) != os.path.normcase(self.config.get("folder", "")))
         if different and not self.load_error:
-            current = self.window._note_snapshot()
+            current = self.window._note_snapshot(synced_only=True)
             events = {}
             for note, data in self.window._notes_to_seed(current).items():
                 event = NoteSyncJournal.revision(note, [], data)
@@ -2072,6 +2313,8 @@ class NoteSyncController(QObject):
         with self.db.conn:
             self.db.conn.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)",
                                  (NOTE_SYNC_CONFIG_KEY, json.dumps(config)))
+            self.db.conn.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)",
+                                 (NOTE_SYNC_MOVES_KEY, self.moves_json(moves)))
             if state is not None:
                 self.db.conn.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)",
                                      (NOTE_SYNC_STATE_KEY, state))
@@ -2081,20 +2324,21 @@ class NoteSyncController(QObject):
         self.cancelled = threading.Event()
         self.generation += 1
         self.config = config
+        self.pending_moves = moves
         self.cache = {}
         self.pending = None
         self.timer.stop()
         self.debounce.stop()
         self.apply_timer.stop()
-        if self.enabled:
-            self.set_status("Saved locally · waiting for folder")
+        if self.enabled or self.pending_moves:
+            self.set_status("Saved locally · shared copy removal pending" if moves else "Saved locally · waiting for folder")
             self.timer.start()
             self.debounce.start()
         else:
             self.set_status("Local only")
 
     def sync_now(self):
-        if self.stopped or self.load_error or not self.enabled:
+        if self.stopped or self.load_error or not (self.enabled or self.pending_moves):
             return
         if self.busy or self.pending is not None:
             return
@@ -2107,13 +2351,28 @@ class NoteSyncController(QObject):
             return
         self.busy = True
         generation, cancelled = self.generation, self.cancelled
-        folder, events, cache = self.config["folder"], dict(self.events), self.cache
-        self.set_status("Updating sync folder…")
+        folder, events, cache = self.config["folder"], self.outgoing_events(), self.cache
+        moves = {path: set(notes) for path, notes in self.pending_moves.items()}
+        enabled, excluded, withdrawn = self.enabled, set(self.excluded), set(self.withdrawn)
+        self.set_status("Moving shared revisions to local storage…" if moves else "Updating sync folder…")
 
         def work():
             result, error = None, ""
             try:
-                result = NoteSyncJournal.exchange(folder, events, cancelled, cache)
+                completed = {}
+                removed = set(withdrawn)
+                for path, notes in moves.items():
+                    moved = NoteSyncJournal.exchange(path, {}, cancelled, {}, withdraw=notes)
+                    if moved is None:
+                        break
+                    completed[path] = notes
+                    removed.update(moved.withdrawn)
+                if not cancelled.is_set():
+                    result = (NoteSyncJournal.exchange(folder, events, cancelled, cache, withdraw=excluded)
+                              if enabled else NoteSyncJournal.Result({}, withdrawn))
+                    if result is not None:
+                        result.completed_moves = completed
+                        result.withdrawn.update(removed)
             except (OSError, ValueError, TypeError, RecursionError) as exc:
                 error = str(exc)
             try:
@@ -2126,12 +2385,35 @@ class NoteSyncController(QObject):
 
     def receive(self, generation, events, error):
         self.busy = False
-        if self.stopped or generation != self.generation or not self.enabled:
+        if self.stopped or generation != self.generation:
             return
         if error:
-            self.set_status("Saved locally · " + error)
+            prefix = "Local tab saved · shared copy removal pending · " if self.pending_moves else "Saved locally · "
+            self.set_status(prefix + error + " · retrying automatically")
             return
         if events is None:
+            return
+        if isinstance(events, NoteSyncJournal.Result):
+            moves = {path: set(notes) for path, notes in self.pending_moves.items()}
+            for path, notes in events.completed_moves.items():
+                if path in moves:
+                    moves[path].difference_update(notes)
+            moves = {path: notes for path, notes in moves.items() if notes}
+            withdrawn = self.withdrawn | events.withdrawn
+            if moves != self.pending_moves or withdrawn != self.withdrawn:
+                try:
+                    with self.db.conn:
+                        self.db.conn.executemany("INSERT OR REPLACE INTO settings VALUES (?, ?)", (
+                            (NOTE_SYNC_MOVES_KEY, self.moves_json(moves)),
+                            (NOTE_SYNC_WITHDRAWN_KEY, json.dumps(sorted(withdrawn)))))
+                except sqlite3.Error:
+                    self.set_status("Local tab saved · could not save removal status · retrying automatically")
+                    return
+            self.pending_moves, self.withdrawn = moves, withdrawn
+        if not self.enabled:
+            self.set_status("Local only" if not self.pending_moves else "Local tab saved · shared copy removal pending")
+            if not self.pending_moves:
+                self.timer.stop()
             return
         self.pending = events
         self.apply_pending()
@@ -2150,17 +2432,22 @@ class NoteSyncController(QObject):
             if not self.window.save_notes():
                 raise sqlite3.OperationalError("The current note could not be saved locally.")
             self.capture()  # includes edits made while the folder worker was running
-            events, notes = NoteSyncJournal.reconcile({**self.pending, **self.events})
+            combined = {key: event for key, event in {**self.pending, **self.events}.items()
+                        if event["note"] not in self.withdrawn}
+            shared = {key: event for key, event in combined.items()
+                      if event["note"] not in self.excluded}
+            events, notes = NoteSyncJournal.reconcile(shared)
             if notes:
                 self.window._apply_synced_notes(notes, events)
-                self.baseline = self.window._note_snapshot()
+                self.baseline = self.window._note_snapshot(synced_only=True)
             else:
                 # All remote notes were deleted: retain one empty local scratch pad.
-                if self.events or self.pending:
+                if self.events or self.pending or any(note in self.withdrawn for note in self.window._note_ids):
                     self.window._apply_synced_notes({}, events)
-                    self.baseline = self.window._note_snapshot()
+                    self.baseline = self.window._note_snapshot(synced_only=True)
             self.events = events
-            unpublished = bool(set(events) - set(self.pending))
+            unpublished = any(key not in self.pending and event["note"] not in self.excluded
+                              for key, event in events.items())
             self.pending = None
             if unpublished:
                 self.set_status("Saved locally · updating recent changes")
@@ -2169,7 +2456,7 @@ class NoteSyncController(QObject):
                 self.set_status("Folder updated " + time.strftime("%H:%M") + " · cloud sync by desktop app")
         except (sqlite3.Error, ValueError) as exc:
             self.pending = None
-            self.set_status("Saved locally · " + str(exc))
+            self.set_status("Saved locally · " + str(exc) + " · retrying automatically")
 
     def stop(self):
         saved = self.window.save_notes()
@@ -2234,7 +2521,7 @@ class NoteSyncDialog(QDialog):
         box.addWidget(self.status)
         actions = QHBoxLayout()
         self.sync = QPushButton("Sync now")
-        self.sync.setEnabled(controller.enabled)
+        self.sync.setEnabled(controller.enabled or bool(controller.pending_moves))
         self.sync.clicked.connect(controller.sync_now)
         actions.addWidget(self.sync)
         actions.addStretch()
@@ -2252,7 +2539,7 @@ class NoteSyncDialog(QDialog):
         self.browse.setEnabled(provider != "local")
         self.setup.setVisible(provider in ("google", "dropbox"))
         self.help.setText({
-            "local": "Notes stay on this PC. Turning sync off keeps your local notes and existing cloud files.",
+            "local": "Notes stay on this PC. Ordinary syncing stops; explicit per-tab Local only moves still remove their shared copies.",
             "google": "Sign in to Google Drive for desktop, then choose a folder from that account. This syncs PyClip notes, not Google Keep.",
             "dropbox": "Sign in to the Dropbox desktop app, then choose a folder from that account.",
             "folder": "Choose a folder managed by your sync app or a shared drive.",
@@ -2309,11 +2596,12 @@ class HistoryWindow(QWidget):
         self._notes_open = False
         self._notepad_pinned = False  # notepad-only, always-on-top mode
         self._notepad_width = NOTEPAD_WIDTH
-        self._resize_origin = None
         self._edge_origin = None      # window geometry when an edge was grabbed
+        self._edge_resizes_notes = None
+        self._divider_origin = None
         self._edge_grips = []
-        self._dir_open = False        # the folder panel (DIR or FAV) is showing
-        self._dir_fav = False         # ... and it is listing favourites only
+        self._dir_open = False
+        self._reuse_open = False
 
         self.setObjectName("root")
         self.setWindowTitle("PyClip")
@@ -2339,7 +2627,7 @@ class HistoryWindow(QWidget):
         self._tabs_row.setFixedHeight(row_height)
         self._note_add.setFixedHeight(row_height)
         self._dir_tab.setFixedHeight(row_height)
-        self._fav_tab.setFixedHeight(row_height)
+        self._reuse_tab.setFixedHeight(row_height)
         self._restore_notepad()
         self.note_sync = NoteSyncController(self)
         self.note_sync.status_changed.connect(self._sync_status_changed)
@@ -2409,7 +2697,7 @@ class HistoryWindow(QWidget):
             "Remove saved clipboard entries of 10 MB or more, largest first.\n"
             + ("Pinned entries are kept.\n" if CLEANUP_KEEP_PINNED else
                "Includes pinned clipboard entries.\n")
-            + "Original files, notes and DIR locations are kept."
+            + "Reuse items, original files, notes and DIR locations are kept."
         )
         self.cleanup_button.clicked.connect(self._clean_large_clips)
         storage.addWidget(self.cleanup_button)
@@ -2433,6 +2721,10 @@ class HistoryWindow(QWidget):
                 if not (dx or dy):
                     continue
                 grip = WindowEdgeGrip(dx, dy, self)
+                if dx == 1 and dy == 0:
+                    grip.setObjectName("rightSectionGrip")
+                    grip.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+                    grip.setToolTip("Drag to resize the section on the right")
                 grip.drag_started.connect(self._edge_grabbed)
                 grip.dragged.connect(lambda delta, g=grip: self._edge_dragged(g.side, delta))
                 grip.drag_finished.connect(self._edge_released)
@@ -2455,6 +2747,7 @@ class HistoryWindow(QWidget):
         self._note_ids = []       # portable identity, independent of local slot numbers
         self._note_titles = []    # as stored: empty means "use the position"
         self._note_colors = []
+        self._note_local = []     # per-tab privacy, stored only on this machine
         self._saved_notes = []
         self._note_tabs = []
         self._note_edits = []
@@ -2470,8 +2763,7 @@ class HistoryWindow(QWidget):
         self._note_grip.drag_started.connect(self._grip_grabbed)
         self._note_grip.dragged.connect(self._grip_dragged)
         self._note_grip.drag_finished.connect(self._grip_released)
-        self._note_grip.reset_requested.connect(
-            lambda: self._set_notepad_width(NOTEPAD_WIDTH, remember=True))
+        self._note_grip.reset_requested.connect(self._reset_grip_width)
         shell.addWidget(self._note_grip)
 
         box = QVBoxLayout()
@@ -2501,17 +2793,17 @@ class HistoryWindow(QWidget):
         self._dir_tab.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._dir_tab.setCursor(Qt.CursorShape.PointingHandCursor)
         self._dir_tab.setToolTip("Search previously copied folder locations")
-        self._dir_tab.clicked.connect(lambda: self._show_directories(favorites=False))
+        self._dir_tab.clicked.connect(self._show_directories)
 
-        self._fav_tab = QToolButton()
-        self._fav_tab.setObjectName("noteTab")
-        self._fav_tab.setText("FAV")
-        self._fav_tab.setCheckable(True)
-        self._fav_tab.setFixedWidth(40)
-        self._fav_tab.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._fav_tab.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._fav_tab.setToolTip("Favourite folders  (right-click a folder in DIR to add one)")
-        self._fav_tab.clicked.connect(lambda: self._show_directories(favorites=True))
+        self._reuse_tab = QToolButton()
+        self._reuse_tab.setObjectName("noteTab")
+        self._reuse_tab.setText("Reuse")
+        self._reuse_tab.setCheckable(True)
+        self._reuse_tab.setFixedWidth(55)
+        self._reuse_tab.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._reuse_tab.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._reuse_tab.setToolTip("Favourite clipboard items (right-click an item and choose Add to Reuse)")
+        self._reuse_tab.clicked.connect(self._show_reuse)
 
         self._pin_check = QCheckBox()
         self._pin_check.setObjectName("pinNotepad")
@@ -2527,7 +2819,7 @@ class HistoryWindow(QWidget):
         tabs_bar.setSpacing(2)
         tabs_bar.addWidget(self._tabs_row, 1)
         tabs_bar.addWidget(self._dir_tab)
-        tabs_bar.addWidget(self._fav_tab)
+        tabs_bar.addWidget(self._reuse_tab)
         tabs_bar.addWidget(self._pin_check)
         tabs_bar.addWidget(self._note_add)
         box.addLayout(tabs_bar)
@@ -2535,6 +2827,8 @@ class HistoryWindow(QWidget):
         self._notes_stack = QStackedWidget()
         self.directory_panel = self._build_directory_panel()
         self._notes_stack.addWidget(self.directory_panel)
+        self.reuse_panel = self._build_reuse_panel()
+        self._notes_stack.addWidget(self.reuse_panel)
         box.addWidget(self._notes_stack)
 
         self._panel_hint = hint_label("")
@@ -2547,7 +2841,18 @@ class HistoryWindow(QWidget):
         self._sync_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._sync_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self._sync_button.clicked.connect(self.show_note_sync)
-        box.addWidget(self._sync_button)
+        self._note_local_check = QCheckBox("Local only")
+        self._note_local_check.setToolTip(
+            "Move this tab's shared revisions to this computer and remove the shared tab.\n"
+            "Offline removals finish automatically when the drive reconnects.\n"
+            "Uncheck to share the current contents again as a new shared tab.")
+        self._note_local_check.toggled.connect(
+            lambda checked: self._set_note_local(self._active_note, checked))
+        sync_row = QHBoxLayout()
+        sync_row.setContentsMargins(0, 0, 0, 0)
+        sync_row.addWidget(self._note_local_check)
+        sync_row.addWidget(self._sync_button, 1)
+        box.addLayout(sync_row)
         panel.setFixedWidth(self._notepad_width + NOTE_GRIP_WIDTH)
         return panel
 
@@ -2584,6 +2889,8 @@ class HistoryWindow(QWidget):
             QWidget#noteTabsInner { background:transparent; }
             QWidget#noteGrip { background:#2a2f3a; margin:2px 3px; border-radius:1px; }
             QWidget#noteGrip:hover { background:#4c8bf5; }
+            QWidget#rightSectionGrip { background:#2a2f3a; margin:2px 2px; border-radius:1px; }
+            QWidget#rightSectionGrip:hover { background:#4c8bf5; }
             QCheckBox#pinNotepad { spacing:0; }
             QCheckBox#pinNotepad::indicator { width:13px; height:13px;
                 border:1px solid #3a414f; border-radius:3px; background:#2a2f3a; }
@@ -2608,35 +2915,36 @@ class HistoryWindow(QWidget):
         search = self.search.text().strip() or None
         self.list.clear()
         for clip in self.db.get_clips(search, include_content=False):
-            item = QListWidgetItem()
-            pm = None
-            if clip["kind"] == "image" and clip["data"] and os.path.exists(clip["data"]):
-                pm = load_thumbnail(clip["data"])
-            size = clip_size_bytes(clip)
-            item.setData(Qt.ItemDataRole.UserRole, {
-                "id": clip["id"],
-                "kind": clip["kind"],
-                "primary": clip["preview"] or "",
-                "meta": (f'{clip["kind"].capitalize()} · {format_size(size)}'
-                         f' · {humanize(clip["created_at"])}'),
-                "pinned": clip["pinned"],
-            })
-            size_basis = {
-                "text": "Saved text (UTF-8)",
-                "image": "Saved image (PNG)",
-                "files": "Saved file references (not the files' contents)",
-            }.get(clip["kind"], "Saved clipboard content")
-            item.setToolTip(
-                f"{size_basis}: {size:,} bytes" if size is not None
-                else "Saved clipboard content: size unavailable"
-            )
-            item.setData(Qt.ItemDataRole.UserRole + 1, pm)
-            self.list.addItem(item)
+            self._add_clip_item(self.list, clip)
         if self.list.count():
             self.list.setCurrentRow(0)
         if self._dir_open:
             self._reload_directories()
+        if self._reuse_open:
+            self._reload_reuse()
         self._refresh_storage()
+
+    def _add_clip_item(self, target, clip):
+        item = QListWidgetItem()
+        pm = None
+        if clip["kind"] == "image" and clip["data"] and os.path.exists(clip["data"]):
+            pm = load_thumbnail(clip["data"])
+        size = clip_size_bytes(clip)
+        item.setData(Qt.ItemDataRole.UserRole, {
+            "id": clip["id"], "kind": clip["kind"],
+            "primary": clip["preview"] or "",
+            "meta": (f'{clip["kind"].capitalize()} · {format_size(size)}'
+                     f' · {humanize(clip["created_at"])}'),
+            "pinned": clip["pinned"], "reusable": clip["reuse_added_at"] is not None,
+        })
+        size_basis = {
+            "text": "Saved text (UTF-8)", "image": "Saved image (PNG)",
+            "files": "Saved file references (not the files' contents)",
+        }.get(clip["kind"], "Saved clipboard content")
+        item.setToolTip(f"{size_basis}: {size:,} bytes" if size is not None
+                       else "Saved clipboard content: size unavailable")
+        item.setData(Qt.ItemDataRole.UserRole + 1, pm)
+        target.addItem(item)
 
     def _refresh_storage(self):
         entries = self.db.storage_entries()
@@ -2646,12 +2954,13 @@ class HistoryWindow(QWidget):
                    "Automatic cleanup removes the largest entries above 500 MB.\n"
                    "Counts text, saved PNG images and file references; excludes previews, "
                    "database overhead, notes and DIR locations.")
-        if CLEANUP_KEEP_PINNED and total > HISTORY_MAX_BYTES:
-            self.storage_label.setText(f"History: {format_size(total)} · pinned over limit")
-            details += "\nPinned entries prevent further automatic cleanup."
+        if total > HISTORY_MAX_BYTES:
+            self.storage_label.setText(f"History: {format_size(total)} · saved items over limit")
+        details += "\nReuse items are kept during cleanup."
         self.storage_label.setToolTip(details)
         self.cleanup_button.setEnabled(any(
             entry["size_bytes"] >= LARGE_CLIP_BYTES
+            and entry["reuse_added_at"] is None
             and not (CLEANUP_KEEP_PINNED and entry["pinned"])
             for entry in entries
         ))
@@ -2663,8 +2972,120 @@ class HistoryWindow(QWidget):
         self.cleanup_button.setToolTip(
             f"Removed {count} clipboard entries ({format_size(result['removed_bytes'])}).\n"
             "Clean ≥10 MB removes saved entries of 10 MB or more.\n"
-            "Original files, notes and DIR locations are kept."
+            "Reuse items, original files, notes and DIR locations are kept."
         )
+
+    # ---- reusable clipboard items ------------------------------------------
+
+    def _build_reuse_panel(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        self.reuse_search = QLineEdit()
+        self.reuse_search.setPlaceholderText("Search Reuse items…")
+        self.reuse_search.setClearButtonEnabled(True)
+        self.reuse_search.textChanged.connect(self._reload_reuse)
+        self.reuse_search.installEventFilter(self)
+        layout.addWidget(self.reuse_search)
+        self.reuse_list = QListWidget()
+        self.reuse_list.setItemDelegate(ClipDelegate(self.reuse_list))
+        self.reuse_list.setUniformItemSizes(True)
+        self.reuse_list.setMouseTracking(True)
+        self.reuse_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.reuse_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.reuse_list.itemActivated.connect(self._paste_reuse)
+        self.reuse_list.installEventFilter(self)
+        self.reuse_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.reuse_list.customContextMenuRequested.connect(self._reuse_menu)
+        self.reuse_list.itemSelectionChanged.connect(self._reuse_selection_changed)
+        layout.addWidget(self.reuse_list, 1)
+        self.reuse_empty = hint_label("")
+        self.reuse_empty.setWordWrap(True)
+        layout.addWidget(self.reuse_empty)
+        actions = QHBoxLayout()
+        self._reuse_actions = []
+        for text, callback in (("Copy", self._copy_reuse), ("Paste", self._paste_reuse),
+                               ("Remove", self._remove_reuse)):
+            button = QToolButton()
+            button.setObjectName("dirAction")
+            button.setText(text)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.setEnabled(False)
+            if text == "Remove":
+                button.setToolTip("Remove from Reuse; keep the clipboard entry")
+            button.clicked.connect(callback)
+            self._reuse_actions.append(button)
+            actions.addWidget(button)
+        actions.addStretch()
+        layout.addLayout(actions)
+        return panel
+
+    def _reuse_selection_changed(self):
+        enabled = bool(self.reuse_list.selectedItems())
+        for button in self._reuse_actions:
+            button.setEnabled(enabled)
+
+    def _show_reuse(self, *_):
+        self.save_notes()
+        self._dir_open, self._reuse_open = False, True
+        self._notes_stack.setCurrentWidget(self.reuse_panel)
+        self._remember(DIR_OPEN_KEY, "reuse")
+        self._refresh_note_tabs()
+        self._reload_reuse()
+        self.reuse_search.setFocus()
+
+    def _reload_reuse(self, *_):
+        selected = set(self._selected_ids(self.reuse_list))
+        self.reuse_list.clear()
+        for clip in self.db.get_clips(self.reuse_search.text().strip(), limit=None,
+                                      include_content=False, reuse_only=True):
+            self._add_clip_item(self.reuse_list, clip)
+            if clip["id"] in selected:
+                self.reuse_list.item(self.reuse_list.count() - 1).setSelected(True)
+        if self.reuse_list.count() and not self.reuse_list.selectedItems():
+            self.reuse_list.setCurrentRow(0)
+        self.reuse_empty.setVisible(not self.reuse_list.count())
+        self.reuse_empty.setText("No matching Reuse items." if self.reuse_search.text().strip() else
+                                 "Right-click a clipboard item and choose Add to Reuse.")
+
+    def _set_clip_reuse(self, ids, enabled=True):
+        self.db.set_reuse(ids, enabled)
+        self.reload()
+
+    def _copy_reuse(self, *_):
+        ids = self._selected_ids(self.reuse_list)
+        if ids:
+            self.copy_requested.emit(ids)
+
+    def _paste_reuse(self, *_):
+        ids = self._selected_ids(self.reuse_list)
+        if ids:
+            self.paste_requested.emit(ids)
+
+    def _remove_reuse(self, *_):
+        self._set_clip_reuse(self._selected_ids(self.reuse_list), False)
+
+    def _reuse_menu(self, pos):
+        item = self.reuse_list.itemAt(pos)
+        if not item:
+            return
+        if not item.isSelected():
+            self.reuse_list.clearSelection()
+            self.reuse_list.setCurrentItem(item)
+        ids = self._selected_ids(self.reuse_list)
+        suffix = f"  ({len(ids)})" if len(ids) > 1 else ""
+        menu = QMenu(self)
+        menu.addAction("Paste" + suffix, lambda: self.paste_requested.emit(ids))
+        menu.addAction("Copy to clipboard" + suffix, lambda: self.copy_requested.emit(ids))
+        menu.addSeparator()
+        menu.addAction("Remove from Reuse" + suffix, lambda: self._set_clip_reuse(ids, False))
+        self._menu_open = True
+        try:
+            menu.exec(self.reuse_list.mapToGlobal(pos))
+        finally:
+            self._menu_open = False
 
     # ---- directory history ------------------------------------------------
 
@@ -2718,16 +3139,13 @@ class HistoryWindow(QWidget):
         layout.addWidget(self.dir_status)
         return panel
 
-    def _show_directories(self, favorites=False):
-        """DIR and FAV share one panel; FAV just lists the pinned folders."""
+    def _show_directories(self, *_):
+        """Show previously copied folder locations."""
         self.save_notes()
-        self._dir_open = True
-        self._dir_fav = favorites
+        self._dir_open, self._reuse_open = True, False
         self._notes_stack.setCurrentWidget(self.directory_panel)
         self._refresh_note_tabs()
-        self._remember(DIR_OPEN_KEY, "fav" if favorites else "1")
-        self.dir_search.setPlaceholderText(
-            "Search favourite folders…" if favorites else "Search folders or paths…")
+        self._remember(DIR_OPEN_KEY, "1")
         self._reload_directories()
         self.dir_search.setFocus()
 
@@ -2744,21 +3162,13 @@ class HistoryWindow(QWidget):
         selected = self._selected_directory()
         self.dir_list.clear()
         search = self.dir_search.text()
-        if self._dir_fav:
-            rows = [(row["path"], f'Added: {humanize(row["added_at"])}', True)
-                    for row in self.db.get_favorites(search)]
-        else:
-            favorites = self.db.favorite_keys()
-            rows = [(row["path"], f'Last used: {humanize(row["used_at"])}',
-                     os.path.normcase(row["path"]) in favorites)
-                    for row in self.db.get_directories(search)]
-        for path, when, favorite in rows:
+        rows = [(row["path"], f'Last used: {humanize(row["used_at"])}')
+                for row in self.db.get_directories(search)]
+        for path, when in rows:
             name = os.path.basename(path) or path
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, {
-                "kind": "directory", "path": path, "favorite": favorite,
-                # the star marks favourites in DIR; in FAV every row is one
-                "primary": f"★ {name}" if favorite and not self._dir_fav else name,
+                "kind": "directory", "path": path, "primary": name,
                 "meta": path,
             })
             item.setToolTip(f"{path}\n{when}")
@@ -2771,16 +3181,11 @@ class HistoryWindow(QWidget):
         self.dir_empty.setVisible(not self.dir_list.count())
         if search.strip():
             self.dir_empty.setText("No matching folders.")
-        elif self._dir_fav:
-            self.dir_empty.setText(
-                "No favourites yet. Right-click a folder in DIR and choose Add to Favourites.")
         else:
             self.dir_empty.setText(
                 "Copy a folder, a file, or a full path to add its location here.")
         count = self.dir_list.count()
-        self.dir_status.setText(
-            f"{count} favourite{'' if count == 1 else 's'} · in the order added"
-            if self._dir_fav else f"{count} folders · most recent first")
+        self.dir_status.setText(f"{count} folders · most recent first")
         self.dir_status.setToolTip("")
 
     def _open_directory(self, *_):
@@ -2812,44 +3217,21 @@ class HistoryWindow(QWidget):
         self.dir_list.setCurrentItem(item)
         self._menu_open = True
         menu = QMenu(self)
-        if (item.data(Qt.ItemDataRole.UserRole) or {}).get("favorite"):
-            menu.addAction("Remove from Favourites", self._unfavorite_directory)
-        else:
-            menu.addAction("Add to Favourites", self._favorite_directory)
-        menu.addSeparator()
         menu.addAction("Open folder", self._open_directory)
         menu.addAction("Copy path", self._copy_directory)
-        if not self._dir_fav:
-            menu.addSeparator()
-            menu.addAction("Remove from DIR", self._forget_directory)
+        menu.addSeparator()
+        menu.addAction("Remove from DIR", self._forget_directory)
         try:
             menu.exec(self.dir_list.mapToGlobal(pos))
         finally:
             self._menu_open = False
 
     def _forget_directory(self):
-        """Delete: in FAV that unpins the folder, in DIR it drops it from history."""
-        if self._dir_fav:
-            self._unfavorite_directory()
-            return
+        """Remove a folder location from DIR history."""
         path = self._selected_directory()
         if path:
             self.db.forget_directory(path)
             self._reload_directories()
-
-    def _favorite_directory(self):
-        path = self._selected_directory()
-        if path:
-            self.db.add_favorite(path)
-            self._reload_directories()
-            self.dir_status.setText("Added to Favourites")
-
-    def _unfavorite_directory(self):
-        path = self._selected_directory()
-        if path:
-            self.db.remove_favorite(path)
-            self._reload_directories()
-            self.dir_status.setText("Removed from Favourites")
 
     # ---- notepad -----------------------------------------------------------
 
@@ -2867,20 +3249,33 @@ class HistoryWindow(QWidget):
             self._menu_open = False
             dialog.deleteLater()
 
-    def _note_snapshot(self):
-        return {note: {"text": self._note_edits[i].stored(),
-                       "title": self._note_titles[i], "color": self._note_colors[i],
-                       "position": i} for i, note in enumerate(self._note_ids)}
+    def _local_note_ids(self):
+        return {note for note, local in zip(self._note_ids, self._note_local) if local}
+
+    def _note_snapshot(self, synced_only=False):
+        indices = [i for i in range(len(self._note_ids)) if not synced_only or not self._note_local[i]]
+        return {self._note_ids[i]: {"text": self._note_edits[i].stored(),
+                                  "title": self._note_titles[i], "color": self._note_colors[i],
+                                  "position": position} for position, i in enumerate(indices)}
 
     def _notes_to_seed(self, current):
         slots = dict(zip(self._note_ids, self._note_slots))
-        return {key: data for key, data in current.items() if data["text"] or data["title"]
-                or data["color"].lower() != default_note_color(slots[key]).lower()}
+        local = self._local_note_ids()
+        return {key: data for key, data in current.items() if key not in local and (
+                data["text"] or data["title"]
+                or data["color"].lower() != default_note_color(slots[key]).lower())}
 
     def _apply_synced_notes(self, notes, events):
         """Commit imports and sync history together; keep untouched editors/undo."""
         before = self._note_snapshot()
+        local = self._local_note_ids()
+        notes = {key: data for key, data in notes.items() if key not in self.note_sync.excluded}
         ordered = sorted(notes, key=lambda key: (notes[key]["position"], key))
+        # Local tabs retain their contents, identity and place while shared tabs merge.
+        for position, key in enumerate(self._note_ids):
+            if key in local:
+                notes[key] = before[key]
+                ordered.insert(min(position, len(ordered)), key)
         if not ordered:
             # A tombstone must not leave the notepad without an editable tab.
             old_id = next(iter(before))
@@ -2891,7 +3286,11 @@ class HistoryWindow(QWidget):
                 note = uuid.uuid4().hex
                 notes = {note: {"text": "", "title": "", "color": default_note_color(0), "position": 0}}
             ordered = [note]
+        if len(ordered) >= 1000:
+            raise ValueError("Too many notes to display safely; local tabs were kept.")
         normalized = {key: {**notes[key], "position": i} for i, key in enumerate(ordered)}
+        shared_order = [key for key in ordered if key not in local]
+        baseline = {key: {**notes[key], "position": i} for i, key in enumerate(shared_order)}
         if before == normalized and self.note_sync.events == events:
             return  # steady-state polling must not rewrite the database or undo stacks
         old_slots = dict(zip(self._note_ids, self._note_slots))
@@ -2912,22 +3311,23 @@ class HistoryWindow(QWidget):
         values = {
             NOTE_ORDER_KEY: json.dumps([slots[key] for key in ordered]),
             NOTE_TAB_KEY: str(slots[active]),
-            NOTE_SYNC_STATE_KEY: json.dumps({"events": events, "baseline": normalized}, ensure_ascii=False),
+            NOTE_SYNC_STATE_KEY: json.dumps({"events": events, "baseline": baseline}, ensure_ascii=False),
         }
         for key in ordered:
             for base, field in ((NOTE_TEXT_KEY, "text"), (NOTE_TITLE_KEY, "title"), (NOTE_COLOR_KEY, "color")):
                 values[note_key(base, slots[key])] = normalized[key][field]
             values[note_key(NOTE_ID_KEY, slots[key])] = key
+            values[note_key(NOTE_LOCAL_KEY, slots[key])] = "1" if key in local else "0"
         with self.db.conn:
             for key in set(old_slots) - set(ordered):
-                for base in (NOTE_TEXT_KEY, NOTE_TITLE_KEY, NOTE_COLOR_KEY, NOTE_ID_KEY):
+                for base in (NOTE_TEXT_KEY, NOTE_TITLE_KEY, NOTE_COLOR_KEY, NOTE_ID_KEY, NOTE_LOCAL_KEY):
                     self.db.conn.execute("DELETE FROM settings WHERE key = ?", (note_key(base, old_slots[key]),))
             self.db.conn.executemany("INSERT OR REPLACE INTO settings VALUES (?, ?)", values.items())
         if before == normalized:
             return
-        dir_open, dir_fav = self._dir_open, self._dir_fav
+        dir_open, reuse_open = self._dir_open, self._reuse_open
         arrays = (self._note_ids, self._note_slots, self._note_titles, self._note_colors,
-                  self._saved_notes, self._note_tabs, self._note_edits)
+                  self._note_local, self._saved_notes, self._note_tabs, self._note_edits)
         for i in reversed(range(len(self._note_ids))):
             if self._note_ids[i] in normalized:
                 continue
@@ -2966,14 +3366,15 @@ class HistoryWindow(QWidget):
             self._note_titles[i], self._note_colors[i] = data["title"], data["color"]
             self._tabs_row.strip.layout().insertWidget(i, self._note_tabs[i])
         self._show_note(ordered.index(active))
-        if dir_open:
-            self._dir_open, self._dir_fav = True, dir_fav
-            self._notes_stack.setCurrentWidget(self.directory_panel)
+        if dir_open or reuse_open:
+            self._dir_open, self._reuse_open = dir_open, reuse_open
+            self._notes_stack.setCurrentWidget(self.reuse_panel if reuse_open else self.directory_panel)
+            self._remember(DIR_OPEN_KEY, "reuse" if reuse_open else "1")
             self._refresh_note_tabs()
 
     def _restore_notepad(self):
         """Rebuild the strip the way it was left: same notes, same order, same width."""
-        dir_open = self.db.get_setting(DIR_OPEN_KEY)  # "1" = DIR, "fav" = FAV
+        dir_open = self.db.get_setting(DIR_OPEN_KEY)  # "1" = DIR, "reuse" = Reuse
         limit = 999 if self.db.get_setting(NOTE_SYNC_STATE_KEY) else NOTE_MAX_COUNT
         for slot in clean_note_order(self.db.get_setting(NOTE_ORDER_KEY, ""), limit):
             self._create_note(slot)
@@ -2989,8 +3390,10 @@ class HistoryWindow(QWidget):
         self._set_notepad_visible(self.db.get_setting(NOTE_OPEN_KEY, "0") == "1")
         if self.db.get_setting(NOTE_PINNED_KEY, "0") == "1":
             self._set_notepad_pinned(True)
-        if dir_open in ("1", "fav"):
-            self._show_directories(favorites=dir_open == "fav")
+        if dir_open == "1":
+            self._show_directories()
+        elif dir_open in ("reuse", "fav"):
+            self._show_reuse()
 
     def _create_note(self, slot, position=None):
         """Add one note - its stored text, tab and editor - to the strip.
@@ -3035,6 +3438,7 @@ class HistoryWindow(QWidget):
             self.db.get_setting(note_key(NOTE_TITLE_KEY, slot), "")))
         self._note_colors.insert(position, clean_note_color(
             self.db.get_setting(note_key(NOTE_COLOR_KEY, slot), ""), slot))
+        self._note_local.insert(position, self.db.get_setting(note_key(NOTE_LOCAL_KEY, slot), "0") == "1")
         self._saved_notes.insert(position, text)
         self._note_tabs.insert(position, tab)
         self._note_edits.insert(position, edit)
@@ -3048,32 +3452,39 @@ class HistoryWindow(QWidget):
     def _refresh_note_tabs(self):
         """Repaint every tab's caption/colour and tint every note's editor."""
         for i, tab in enumerate(self._note_tabs):
-            active = i == self._active_note and not self._dir_open
+            active = i == self._active_note and not (self._dir_open or self._reuse_open)
             caption = clean_note_title(self._note_titles[i], i)
-            tab.setCaption(caption)
-            tab.setToolTip(caption)
+            tab.setCaption(("🔒 " if self._note_local[i] else "") + caption)
+            tab.setToolTip(caption + ("\nLocal only · this computer" if self._note_local[i]
+                                      else "\nSync when note sync is enabled"))
             tab.setChecked(active)
             tab.setStyleSheet(note_tab_style(self._note_colors[i], active))
         for i, edit in enumerate(self._note_edits):
             edit.setStyleSheet(note_editor_style(self._note_colors[i]))
         self._note_add.setEnabled(len(self._note_tabs) < NOTE_MAX_COUNT)
-        dir_active = self._dir_open and not self._dir_fav
-        fav_active = self._dir_open and self._dir_fav
+        dir_active = self._dir_open
+        reuse_active = self._reuse_open
+        self._note_local_check.blockSignals(True)
+        self._note_local_check.setChecked(self._note_local[self._active_note])
+        self._note_local_check.setVisible(not (dir_active or reuse_active))
+        self._note_local_check.blockSignals(False)
         self._dir_tab.setChecked(dir_active)
         self._dir_tab.setStyleSheet(note_tab_style("#2ab5a5", dir_active))
-        self._fav_tab.setChecked(fav_active)
-        self._fav_tab.setStyleSheet(note_tab_style("#d9a521", fav_active))
-        self._panel_hint.setText("Favourite folders" if fav_active else
+        self._reuse_tab.setChecked(reuse_active)
+        self._reuse_tab.setStyleSheet(note_tab_style("#d9a521", reuse_active))
+        self._panel_hint.setText("Favourite clipboard items" if reuse_active else
                                  "Folders from clipboard history" if dir_active else
                                  "Drag tabs to reorder · double-click to rename")
-        self._panel_keys.setText("Double-click/Ctrl+C copies · Enter opens · right-click for more"
+        self._panel_keys.setText("Enter/double-click pastes · Ctrl+C copies · Del removes from Reuse"
+                                 if reuse_active else
+                                 "Double-click/Ctrl+C copies · Enter opens · right-click for more"
                                  if self._dir_open else
                                  "Ctrl+T adds · Ctrl+W closes · right-click for more")
 
     def _show_note(self, index):
         """Put note ``index`` on screen, without touching what was saved."""
         index = max(0, min(index, len(self._note_edits) - 1))
-        self._dir_open = False
+        self._dir_open, self._reuse_open = False, False
         self._remember(DIR_OPEN_KEY, "0")
         self._active_note = index
         self.notes = self._note_edits[index]
@@ -3082,7 +3493,7 @@ class HistoryWindow(QWidget):
         self._tabs_row.keep_visible(self._note_tabs[index])
 
     def _switch_note(self, index):
-        if index == self._active_note and not self._dir_open:
+        if index == self._active_note and not (self._dir_open or self._reuse_open):
             return
         self.save_notes()  # flush the note we're leaving before switching away
         self._show_note(index)
@@ -3090,7 +3501,7 @@ class HistoryWindow(QWidget):
         self.notes.setFocus()
 
     def _cycle_note(self, delta):
-        if self._dir_open:
+        if self._dir_open or self._reuse_open:
             self._switch_note(0 if delta > 0 else len(self._note_edits) - 1)
             return
         self._switch_note((self._active_note + delta) % len(self._note_edits))
@@ -3123,6 +3534,7 @@ class HistoryWindow(QWidget):
         tab = self._note_tabs.pop(index)
         edit = self._note_edits.pop(index)
         del self._note_titles[index], self._note_colors[index], self._saved_notes[index]
+        del self._note_local[index]
         del self._note_ids[index]
 
         self._tabs_row.strip.layout().removeWidget(tab)
@@ -3133,7 +3545,7 @@ class HistoryWindow(QWidget):
         edit.setParent(None)
         edit.deleteLater()
 
-        for base in (NOTE_TEXT_KEY, NOTE_TITLE_KEY, NOTE_COLOR_KEY, NOTE_ID_KEY):
+        for base in (NOTE_TEXT_KEY, NOTE_TITLE_KEY, NOTE_COLOR_KEY, NOTE_ID_KEY, NOTE_LOCAL_KEY):
             self._forget(note_key(base, slot))
         self._save_note_order()
 
@@ -3188,7 +3600,7 @@ class HistoryWindow(QWidget):
         if source == target:
             return
         for row in (self._note_slots, self._note_ids, self._note_titles, self._note_colors,
-                    self._saved_notes, self._note_tabs, self._note_edits):
+                    self._note_local, self._saved_notes, self._note_tabs, self._note_edits):
             row.insert(target, row.pop(source))
         layout = self._tabs_row.strip.layout()
         layout.insertWidget(target, layout.takeAt(source).widget())
@@ -3211,6 +3623,11 @@ class HistoryWindow(QWidget):
         self._menu_open = True
         menu = QMenu(self)
         menu.addAction("Rename…", lambda: self._start_rename(index))
+        local_action = menu.addAction("Local only (this computer)")
+        local_action.setCheckable(True)
+        local_action.setChecked(self._note_local[index])
+        local_action.toggled.connect(lambda checked: self._set_note_local(index, checked))
+        local_action.setToolTip("Uncheck to include this tab in note sync")
         menu.addSeparator()
         current = self._note_colors[index].lower()
         for name, colour in NOTE_COLORS:
@@ -3223,8 +3640,14 @@ class HistoryWindow(QWidget):
         new.setEnabled(len(self._note_tabs) < NOTE_MAX_COUNT)
         close = menu.addAction("Close note", lambda: self._close_note(index))
         close.setEnabled(len(self._note_tabs) > NOTE_MIN_COUNT)
-        menu.exec(tab.mapToGlobal(pos))
-        self._menu_open = False
+        try:
+            menu.exec(tab.mapToGlobal(pos))
+        finally:
+            self._menu_open = False
+
+    def _set_note_local(self, index, local):
+        if not self.note_sync.set_note_local(index, local):
+            self._refresh_note_tabs()
 
     def _set_note_color(self, index, colour):
         self._note_colors[index] = colour
@@ -3287,46 +3710,71 @@ class HistoryWindow(QWidget):
                 + NOTE_GRIP_WIDTH + self._notepad_width)
 
     def _grip_grabbed(self):
-        self._resize_origin = (self._notepad_width, self.x())
+        if self._notepad_pinned:
+            self._edge_grabbed()
+        else:
+            self._divider_origin = (self._history_width, self._notepad_width)
 
     def _grip_dragged(self, delta):
-        if self._resize_origin is None:
+        if self._notepad_pinned:
+            self._edge_dragged((-1, 0), QPoint(delta, 0), resize_notes=True)
             return
-        start_width, start_x = self._resize_origin
-        width = max(NOTEPAD_MIN_WIDTH, min(NOTEPAD_MAX_WIDTH, start_width - delta))
-        # Anchor the window's right edge so the grip stays under the cursor.
-        self._set_notepad_width(width, anchor_x=start_x - (width - start_width))
+        if self._divider_origin is None:
+            return
+        history, notes = self._divider_origin
+        total = history + notes
+        least = max(HISTORY_MIN_WIDTH, total - NOTEPAD_MAX_WIDTH)
+        most = total - NOTEPAD_MIN_WIDTH
+        self._history_width = max(least, min(most, history + delta))
+        self._notepad_width = total - self._history_width
+        self.notepad.setFixedWidth(self._notepad_width + NOTE_GRIP_WIDTH)
+        self.layout().activate()
 
     def _grip_released(self):
-        self._resize_origin = None
-        self._remember(NOTE_WIDTH_KEY, str(self._notepad_width))
+        if self._notepad_pinned:
+            self._edge_released()
+        elif self._divider_origin is not None:
+            self._divider_origin = None
+            self._remember(HISTORY_WIDTH_KEY, str(self._history_width))
+            self._remember(NOTE_WIDTH_KEY, str(self._notepad_width))
+
+    def _reset_grip_width(self):
+        if self._notepad_pinned:
+            self._set_notepad_width(NOTEPAD_WIDTH, remember=True)
+        else:
+            self._grip_grabbed()
+            self._grip_dragged(self.BASE_WIDTH - self._history_width)
+            self._grip_released()
 
     # ---- resizing from the window's edges ----------------------------------
 
-    def _fixed_width(self):
-        """The part of the window an edge drag leaves alone: everything beside
-        the clip list, or beside the pad when it is pinned on its own."""
+    def _fixed_width(self, resize_notes=False):
+        """The part of the window outside the section being resized."""
         if self._notepad_pinned:
             return self._open_width() - self._notepad_width
         if self._notes_open:
-            return self._open_width() - self._history_width
+            return self._open_width() - (
+                self._notepad_width if resize_notes else self._history_width)
         return 0
 
     def _edge_grabbed(self):
         self._edge_origin = self.geometry()
+        self._edge_resizes_notes = None
 
-    def _edge_dragged(self, side, delta):
+    def _edge_dragged(self, side, delta, resize_notes=None):
         """Resize from the grabbed side; the opposite side stays where it was.
 
-        Extra width goes to the clip list - the pad keeps the width its own
-        grip gave it - unless the pad is pinned alone, when it is the pad's.
+        The right edge sizes notes when visible; the left edge sizes clipboard
+        history. The divider redistributes space separately.
         """
         if self._edge_origin is None:
             return
         start, (dx, dy) = self._edge_origin, side
         screen = self.screen().availableGeometry()
-        fixed = self._fixed_width()
-        if self._notepad_pinned:
+        if resize_notes is None:
+            resize_notes = self._notepad_pinned or (self._notes_open and dx > 0)
+        fixed = self._fixed_width(resize_notes)
+        if resize_notes:
             least_w = fixed + NOTEPAD_MIN_WIDTH
             most_w = min(screen.width(), fixed + NOTEPAD_MAX_WIDTH)
         else:
@@ -3339,21 +3787,24 @@ class HistoryWindow(QWidget):
         top, bottom = dragged_span(start.top(), start.bottom(), dy, delta.y(),
                                    least_h, screen.height(), screen.top(), screen.bottom())
         width = right - left + 1
-        if self._notepad_pinned:
+        if dx and resize_notes:
             self._notepad_width = width - fixed
             self.notepad.setFixedWidth(self._notepad_width + NOTE_GRIP_WIDTH)
             self.layout().activate()  # release the pad's old minimum before shrinking
-        else:
+        elif dx:
             self._history_width = width - fixed
+        if dx:
+            self._edge_resizes_notes = resize_notes
         self.setGeometry(left, top, width, bottom - top + 1)
 
     def _edge_released(self):
         self._edge_origin = None
         self._remember(WINDOW_HEIGHT_KEY, str(self.height()))
-        if self._notepad_pinned:
+        if self._edge_resizes_notes is True:
             self._remember(NOTE_WIDTH_KEY, str(self._notepad_width))
-        else:
+        elif self._edge_resizes_notes is False:
             self._remember(HISTORY_WIDTH_KEY, str(self._history_width))
+        self._edge_resizes_notes = None
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -3380,8 +3831,11 @@ class HistoryWindow(QWidget):
     def _toggle_notepad(self, *_):
         visible = not self._notes_open
         self._set_notepad_visible(visible)
-        (self.dir_search if visible and self._dir_open else
-         self.notes if visible else self.search).setFocus()
+        (self._right_panel_focus() if visible else self.search).setFocus()
+
+    def _right_panel_focus(self):
+        return (self.reuse_search if self._reuse_open else
+                self.dir_search if self._dir_open else self.notes)
 
     def _set_notepad_pinned(self, pinned):
         """Notepad-only mode: hide the clip list and stay up when the popup
@@ -3396,6 +3850,9 @@ class HistoryWindow(QWidget):
             self._set_notepad_visible(True)
         self.history_panel.setVisible(not pinned)
         self.notes_toggle.setEnabled(not pinned)
+        self._note_grip.setToolTip(
+            "Drag to resize the notepad  (double-click to reset)" if pinned else
+            "Drag to adjust space between clipboard and notes  (double-click to reset)")
         self.layout().activate()  # settle the layout before sizing off of it
 
         if pinned:
@@ -3762,15 +4219,17 @@ class HistoryWindow(QWidget):
         self.raise_()
         force_foreground(int(self.winId()))
         self.activateWindow()
-        (self.dir_search if self._notes_open and self._dir_open else
-         self.notes if self._notepad_pinned else self.search).setFocus()
+        (self._right_panel_focus()
+         if self._notes_open and (self._dir_open or self._reuse_open or self._notepad_pinned)
+         else self.search).setFocus()
         QTimer.singleShot(250, lambda: setattr(self, "_ignore_deactivate", False))
 
-    def _selected_ids(self):
+    def _selected_ids(self, target=None):
         """Ids of selected rows, in top-to-bottom display order."""
+        target = self.list if target is None else target
         ids = []
-        for row in range(self.list.count()):
-            item = self.list.item(row)
+        for row in range(target.count()):
+            item = target.item(row)
             if item.isSelected():
                 data = item.data(Qt.ItemDataRole.UserRole) or {}
                 if "id" in data:
@@ -3817,14 +4276,20 @@ class HistoryWindow(QWidget):
         menu.addAction("Paste" + suffix, lambda: self.paste_requested.emit(ids))
         menu.addAction("Copy to clipboard" + suffix,
                        lambda: self.copy_requested.emit(ids))
+        in_reuse = all((row.data(Qt.ItemDataRole.UserRole) or {}).get("reusable")
+                       for row in self.list.selectedItems())
+        menu.addAction(("Remove from Reuse" if in_reuse else "Add to Reuse") + suffix,
+                       lambda: self._set_clip_reuse(ids, not in_reuse))
         if n == 1:
             data = item.data(Qt.ItemDataRole.UserRole) or {}
             menu.addAction("Unpin" if data.get("pinned") else "Pin",
                            lambda: self._do(self.db.toggle_pin, ids[0]))
         menu.addSeparator()
         menu.addAction("Delete" + suffix, lambda: self._delete_ids(ids))
-        menu.exec(self.list.mapToGlobal(pos))
-        self._menu_open = False
+        try:
+            menu.exec(self.list.mapToGlobal(pos))
+        finally:
+            self._menu_open = False
 
     def _do(self, fn, clip_id):
         fn(clip_id)
@@ -3834,6 +4299,7 @@ class HistoryWindow(QWidget):
     def eventFilter(self, obj, event):
         if (event.type() == QEvent.Type.KeyPress
                 and obj in (self.search, self.list, self.dir_search, self.dir_list,
+                            self.reuse_search, self.reuse_list,
                             *self._note_edits)):
             key = event.key()
             ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
@@ -3845,6 +4311,34 @@ class HistoryWindow(QWidget):
             if ctrl and key == Qt.Key.Key_N:
                 self._toggle_notepad()
                 return True
+
+            if obj in (self.reuse_search, self.reuse_list):
+                shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                if ctrl and key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
+                    self._cycle_note(-1 if shift else 1)
+                    return True
+                if ctrl and key == Qt.Key.Key_T:
+                    self._add_note()
+                    return True
+                if ctrl and key == Qt.Key.Key_W:
+                    return True  # Reuse is a permanent tab.
+                if ctrl and key == Qt.Key.Key_C:
+                    if obj is self.reuse_search and self.reuse_search.hasSelectedText():
+                        return super().eventFilter(obj, event)
+                    self._copy_reuse()
+                    return True
+                if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                    self._paste_reuse()
+                    return True
+                if obj is self.reuse_search and key in (
+                        Qt.Key.Key_Up, Qt.Key.Key_Down,
+                        Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
+                    self._move(key, self.reuse_list)
+                    return True
+                if obj is self.reuse_list and key == Qt.Key.Key_Delete:
+                    self._remove_reuse()
+                    return True
+                return super().eventFilter(obj, event)
 
             if obj in (self.dir_search, self.dir_list):
                 shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
@@ -3957,6 +4451,8 @@ class HistoryWindow(QWidget):
             # The folder filter lasts only as long as the popup is on screen;
             # clearing rebuilds the unfiltered list ready for the next visit.
             self.dir_search.clear()
+        if self.reuse_search.text():
+            self.reuse_search.clear()
         super().hideEvent(event)
 
 
@@ -4190,7 +4686,7 @@ def main():
         if window.isVisible():
             window.reload()
 
-    menu.addAction("Clear history (keep pinned)", clear_all)
+    menu.addAction("Clear history (keep pinned and Reuse)", clear_all)
     menu.addAction("Clean large clipboard items (10 MB+)", window._clean_large_clips)
     menu.addSeparator()
 
